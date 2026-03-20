@@ -14,6 +14,21 @@ CUBE_TAG_SIZE = 0.0207
 
 robot_ip = ''
 
+def rot_to_rpy(R):
+    sy = numpy.sqrt(R[0,0]**2 + R[1,0]**2)
+    singular = sy < 1e-6
+
+    if not singular:
+        roll  = numpy.arctan2(R[2,1], R[2,2])
+        pitch = numpy.arctan2(-R[2,0], sy)
+        yaw   = numpy.arctan2(R[1,0], R[0,0])
+    else:
+        roll  = numpy.arctan2(-R[1,2], R[1,1])
+        pitch = numpy.arctan2(-R[2,0], sy)
+        yaw   = 0
+
+    return numpy.degrees([roll, pitch, yaw])
+
 def grasp_cube(arm, cube_pose):
     """
     Execute a pick sequence to grasp a cube at a specified pose.
@@ -41,8 +56,17 @@ def place_cube(arm, cube_pose):
         A 4x4 transformation matrix representing the target placement pose in the robot base frame.
         All translational units in this matrix are in meters.
     """
-    # TODO
-    pass
+    x = cube_pose[0, 3] * 1000
+    y = cube_pose[1, 3] * 1000
+    z = cube_pose[2, 3] * 1000
+
+    R = cube_pose[:3, :3]
+    roll, pitch, yaw = rot_to_rpy(R)
+    
+    arm.set_position(x, y, z, roll, pitch, yaw, is_radian=False, wait=False)
+    
+    arm.open_lite6_gripper()
+    arm.stop_lite6_gripper()
 
 def get_transform_cube(observation, camera_intrinsic, camera_pose):
     """
