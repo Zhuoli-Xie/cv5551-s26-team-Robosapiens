@@ -27,6 +27,25 @@ def grasp_cube(arm, cube_pose):
         All translational units in this matrix are in meters.
     """
     # TODO
+    def to_xarm_params(pose):
+        t = pose[:3, 3] * 1000
+        rpy = Rotation.from_matrix(pose[:3, :3]).as_euler('xyz', degrees=True)
+        return [t[0], t[1], t[2], rpy[0], rpy[1], rpy[2]]
+    
+    pre_grasp_pose = cube_pose.copy()
+    pre_grasp_pose[2, 3] += 0.1
+
+    arm.set_position(*to_xarm_params(pre_grasp_pose), speed=100, mvacc=500, wait=True)
+
+    arm.open_lite6_gripper()
+    time.sleep(0.5)
+
+    arm.set_position(*to_xarm_params(cube_pose), speed=30, mvacc=200, wait=True)
+
+    arm.close_lite6_gripper()
+    time.sleep(0.8)
+
+    arm.set_position(*to_xarm_params(pre_grasp_pose), speed=30, mvacc=200, wait=True)
     pass
 
 def place_cube(arm, cube_pose):
