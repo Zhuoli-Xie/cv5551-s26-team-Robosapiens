@@ -2,7 +2,7 @@
 
 #### Project title: 
 
-SE(3)-Invariant Grasp Learning for Category-Level Object Generalization
+Learning Grasp Transfer for Category-Level Object
 
 #### member:
 
