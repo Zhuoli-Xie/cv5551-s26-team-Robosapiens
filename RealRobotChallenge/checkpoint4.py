@@ -1,3 +1,4 @@
+from checkpoint0 import get_transform_camera_robot
 from checkpoint3 import CubePoseDetector
 
 import cv2, time
@@ -8,7 +9,7 @@ from utils.zed_camera import ZedCamera
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH
 
 # TODO
-STACK_HEIGHT = None   # Determine a suitable height yourself
+STACK_HEIGHT = 0.026   # Determine a suitable height yourself
 
 robot_ip = ''
 
@@ -34,8 +35,13 @@ def main():
     try:
         # Get Observation
         cv_image = zed.image
+        t_robot_red, t_cam_red = cube_pose_detector.get_transforms(cv_image, 'red cube')
+        t_robot_green, t_cam_green = cube_pose_detector.get_transforms(cv_image, 'green cube')
 
-        # TODO
+        grasp_cube(arm, t_robot_red)
+        time.sleep(0.5)
+        t_robot_green[2, 3] += STACK_HEIGHT
+        place_cube(arm, t_robot_green)
     
     finally:
         # Close Lite6 Robot
