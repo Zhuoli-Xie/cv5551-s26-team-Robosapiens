@@ -100,6 +100,7 @@ class CubePoseDetector:
 
         # Create color mask
         mask = self._get_color_mask(bgr_image, color)
+        cv2.imwrite("mask.png", mask)
 
         # Detect all AprilTags
         gray = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY) if len(observation.shape) > 2 else observation
