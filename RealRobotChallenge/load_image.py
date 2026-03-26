@@ -6,12 +6,13 @@ def load_image(image_path):
     """
     Load image from file (original, no processing)
     """
-    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    rgb = cv2.imread("rgb.png", cv2.IMREAD_COLOR)
+    depth = cv2.imread("depth.png", cv2.IMREAD_UNCHANGED)
 
     if img is None:
         raise ValueError(f"Cannot load image: {image_path}")
 
-    return img
+    return img, depth
 
 
 def main():
@@ -22,7 +23,7 @@ def main():
     image_path = sys.argv[1]
 
     # 读取图片
-    img = load_image(image_path)
+    img, depth = load_image(image_path)
 
     # 打印基本信息（方便你确认格式）
     print("Image shape:", img.shape)
@@ -31,6 +32,8 @@ def main():
     # 显示图片
     cv2.namedWindow("Image", cv2.WINDOW_NORMAL)
     cv2.imshow("Image", img)
+    cv2.imwrite("color_out.png", img)
+    cv2.imwrite("depth_out.png", depth)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
