@@ -1,42 +1,43 @@
+import pyzed.sl as sl
+import numpy as np
 import cv2
-import sys
-
-
-def load_image(image_path):
-    """
-    Load image from file (original, no processing)
-    """
-    rgb = cv2.imread("rgb.png", cv2.IMREAD_COLOR)
-    depth = cv2.imread("depth.png", cv2.IMREAD_UNCHANGED)
-
-    if img is None:
-        raise ValueError(f"Cannot load image: {image_path}")
-
-    return img, depth
-
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python load_image.py <image_path>")
+    zed = sl.Camera()
+
+    init_params = sl.InitParameters()
+    init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
+    init_params.coordinate_units = sl.UNIT.METER
+
+    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+        print("Failed to open ZED")
         return
 
-    image_path = sys.argv[1]
+    runtime = sl.RuntimeParameters()
 
-    # 读取图片
-    img, depth = load_image(image_path)
+    image = sl.Mat()
+    depth = sl.Mat()
 
-    # 打印基本信息（方便你确认格式）
-    print("Image shape:", img.shape)
-    print("Image dtype:", img.dtype)
+    if zed.grab(runtime) == sl.ERROR_CODE.SUCCESS:
+        zed.retrieve_image(image, sl.VIEW.LEFT)
+        zed.retrieve_measure(depth, sl.MEASURE.DEPTH)
 
-    # 显示图片
-    cv2.namedWindow("Image", cv2.WINDOW_NORMAL)
-    cv2.imshow("Image", img)
-    cv2.imwrite("color_out.png", img)
-    cv2.imwrite("depth_out.png", depth)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+        rgb = image.get_data()
+        depth_map = depth.get_data()
 
+        print("RGB shape:", rgb.shape)
+        print("Depth shape:", depth_map.shape)
+
+        cv2.imshow("RGB", rgb)
+
+        # depth 需要可视化（否则你会觉得“啥都没有”）
+        depth_vis = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
+        depth_vis = depth_vis.astype(np.uint8)
+        cv2.imshow("Depth", depth_vis)
+
+        cv2.waitKey(0)
+
+    zed.close()
 
 if __name__ == "__main__":
     main()
