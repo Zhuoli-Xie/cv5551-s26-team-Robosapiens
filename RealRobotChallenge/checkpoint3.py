@@ -1,6 +1,7 @@
 import cv2, numpy, time
 from pupil_apriltags import Detector
 from xarm.wrapper import XArmAPI
+from scipy.spatial.transform import Rotation
 
 from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
@@ -18,6 +19,14 @@ class CubePoseDetector:
     'blue cube') and determine the cube's pose by the AprilTags.
     """
 
+    # HSV color ranges for each cube color
+    COLOR_RANGES = {
+        'red':   [( numpy.array([0, 100, 100]),   numpy.array([10, 255, 255])  ),
+                  ( numpy.array([160, 100, 100]), numpy.array([180, 255, 255]) )],
+        'blue':  [( numpy.array([100, 100, 100]), numpy.array([130, 255, 255]) )],
+        'green': [( numpy.array([40, 80, 80]),    numpy.array([80, 255, 255])  )],
+    }
+
     def __init__(self, camera_intrinsic):
         """
         Initialize the CubePoseDetector with camera parameters.
@@ -28,7 +37,32 @@ class CubePoseDetector:
             The 3x3 intrinsic camera matrix.
         """
         self.camera_intrinsic = camera_intrinsic
-        # TODO
+        self.detector = Detector(families=CUBE_TAG_FAMILY)
+        self.t_cam_robot = None
+
+    def set_camera_pose(self, t_cam_robot):
+        """Store the camera-to-robot transformation."""
+        self.t_cam_robot = t_cam_robot
+
+    def _parse_color(self, cube_prompt):
+        """Extract the color name from the text prompt."""
+        prompt_lower = cube_prompt.lower()
+        for color in self.COLOR_RANGES:
+            if color in prompt_lower:
+                return color
+        return None
+
+    def _get_color_mask(self, image, color):
+        """Create a binary mask for the specified color using HSV thresholding."""
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
+        for lower, upper in self.COLOR_RANGES[color]:
+            mask |= cv2.inRange(hsv, lower, upper)
+        # Clean up the mask
+        kernel = numpy.ones((5, 5), numpy.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        return mask
 
     def get_transforms(self, observation, cube_prompt):
         """
@@ -45,12 +79,86 @@ class CubePoseDetector:
         Returns
         -------
         tuple or None
-            If successful, returns a tuple (t_robot_cube, t_cam_cube) where both 
-            are 4x4 transformation matrices with translations in meters. 
+            If successful, returns a tuple (t_robot_cube, t_cam_cube) where both
+            are 4x4 transformation matrices with translations in meters.
             If no matching object or tag is found, returns None.
         """
-        # TODO
-        pass
+        # Parse target color from prompt
+        color = self._parse_color(cube_prompt)
+        if color is None:
+            print(f'Unknown color in prompt: {cube_prompt}')
+            return None
+
+        # Prepare BGR image for color detection
+        if len(observation.shape) == 2:
+            print('Color image required for color detection.')
+            return None
+        if observation.shape[2] == 4:
+            bgr_image = cv2.cvtColor(observation, cv2.COLOR_BGRA2BGR)
+        else:
+            bgr_image = observation
+
+        # Create color mask
+        mask = self._get_color_mask(bgr_image, color)
+
+        # Detect all AprilTags
+        gray = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY) if len(observation.shape) > 2 else observation
+        tags = self.detector.detect(gray, estimate_tag_pose=False)
+        print(f'Detected {len(tags)} tags, looking for {color} cube')
+
+        # Find which tag's center falls inside the color mask
+        target_tag = None
+        for tag in tags:
+            cx, cy = int(tag.center[0]), int(tag.center[1])
+            if 0 <= cy < mask.shape[0] and 0 <= cx < mask.shape[1]:
+                if mask[cy, cx] > 0:
+                    target_tag = tag
+                    break
+
+        # If center didn't match, try checking which tag has most corner overlap with the mask
+        if target_tag is None:
+            best_score = 0
+            for tag in tags:
+                score = 0
+                for corner in tag.corners:
+                    cx, cy = int(corner[0]), int(corner[1])
+                    if 0 <= cy < mask.shape[0] and 0 <= cx < mask.shape[1]:
+                        if mask[cy, cx] > 0:
+                            score += 1
+                if score > best_score:
+                    best_score = score
+                    target_tag = tag
+            if best_score == 0:
+                print(f'No tag found on {color} cube.')
+                return None
+
+        print(f'Matched tag ID {target_tag.tag_id} for {color} cube')
+
+        # Compute pose via PnP
+        half = CUBE_TAG_SIZE / 2
+        object_points = numpy.array([
+            [-half,  half, 0],
+            [-half, -half, 0],
+            [ half, -half, 0],
+            [ half,  half, 0],
+        ], dtype=numpy.float64)
+
+        image_points = target_tag.corners.astype(numpy.float64)
+
+        success, rvec, tvec = cv2.solvePnP(object_points, image_points, self.camera_intrinsic, None)
+        if not success:
+            print('PnP failed for target cube.')
+            return None
+
+        rmat, _ = cv2.Rodrigues(rvec)
+        t_cam_cube = numpy.eye(4)
+        t_cam_cube[:3, :3] = rmat
+        t_cam_cube[:3, 3] = tvec.flatten()
+
+        # Transform to robot frame
+        t_robot_cube = numpy.linalg.inv(self.t_cam_robot) @ t_cam_cube
+
+        return t_robot_cube, t_cam_cube
 
 def main():
 
@@ -75,8 +183,17 @@ def main():
         # Get Observation
         cv_image = zed.image
 
-        t_cam_cube = None
-        # TODO
+        # Get camera-to-robot transformation
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        if t_cam_robot is None:
+            return
+        cube_pose_detector.set_camera_pose(t_cam_robot)
+
+        # Detect target cube pose
+        result = cube_pose_detector.get_transforms(cv_image, cube_prompt)
+        if result is None:
+            return
+        t_robot_cube, t_cam_cube = result
 
         # Visualization
         draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
@@ -88,7 +205,11 @@ def main():
         if key == ord('k'):
             cv2.destroyAllWindows()
 
-            # TODO
+            # Grasp the target cube
+            grasp_cube(arm, t_robot_cube)
+
+            # Place the cube back down
+            place_cube(arm, t_robot_cube)
             
     finally:
         # Close Lite6 Robot
