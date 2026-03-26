@@ -40,7 +40,79 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     """
     image, point_cloud = observation
 
-    # TODO
+    # Extract XYZ from point cloud (H, W, 4) -> (N, 3), filter NaN/Inf
+    points_cam = point_cloud[:, :, :3].reshape(-1, 3)
+    valid_mask = numpy.isfinite(points_cam).all(axis=1)
+    points_cam = points_cam[valid_mask]
+
+    if points_cam.shape[0] == 0:
+        print('No valid points in point cloud.')
+        return None
+
+    # Transform points from camera frame to robot frame
+    t_robot_cam = numpy.linalg.inv(camera_pose)
+    points_robot = (t_robot_cam[:3, :3] @ points_cam.T + t_robot_cam[:3, 3:4]).T
+
+    # Filter points within the workspace (table area)
+    # Keep points that are above the table surface and within reasonable bounds
+    workspace_mask = (
+        (points_robot[:, 2] > 0.005) &   # above table surface
+        (points_robot[:, 2] < 0.08) &     # below a reasonable height (cube is ~25mm)
+        (points_robot[:, 0] > -0.1) &     # workspace x bounds
+        (points_robot[:, 0] < 0.5) &
+        (points_robot[:, 1] > -0.5) &     # workspace y bounds
+        (points_robot[:, 1] < 0.5)
+    )
+    cube_points_robot = points_robot[workspace_mask]
+
+    if cube_points_robot.shape[0] < 10:
+        print('Insufficient points for cube detection.')
+        return None
+
+    # Create Open3D point cloud and remove outliers
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(cube_points_robot)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+    # Cluster using DBSCAN to isolate the cube
+    labels = numpy.array(pcd.cluster_dbscan(eps=0.01, min_points=10))
+    if len(labels) == 0 or labels.max() < 0:
+        print('No clusters found.')
+        return None
+
+    # Pick the largest cluster as the cube
+    unique_labels, counts = numpy.unique(labels[labels >= 0], return_counts=True)
+    largest_label = unique_labels[numpy.argmax(counts)]
+    cube_indices = numpy.where(labels == largest_label)[0]
+    cube_pcd = pcd.select_by_index(cube_indices)
+
+    # Get oriented bounding box for pose estimation
+    obb = cube_pcd.get_oriented_bounding_box()
+
+    # Build transformation matrix in robot frame
+    center = numpy.array(obb.center)
+    rotation = numpy.array(obb.R)
+
+    # Ensure the rotation matrix is right-handed (det = +1)
+    if numpy.linalg.det(rotation) < 0:
+        rotation[:, 2] *= -1
+
+    # Align z-axis to point upward in robot frame:
+    # Find which column of the rotation matrix is most aligned with the world z-axis
+    z_axis_idx = numpy.argmax(numpy.abs(rotation[2, :]))
+    if rotation[2, z_axis_idx] < 0:
+        rotation[:, z_axis_idx] *= -1
+        other_idx = [i for i in range(3) if i != z_axis_idx][0]
+        rotation[:, other_idx] *= -1
+
+    t_robot_cube = numpy.eye(4)
+    t_robot_cube[:3, :3] = rotation
+    t_robot_cube[:3, 3] = center
+
+    # Convert back to camera frame for visualization
+    t_cam_cube = camera_pose @ t_robot_cube
+
+    return t_robot_cube, t_cam_cube
 
 def main():
 
@@ -63,9 +135,17 @@ def main():
         cv_image = zed.image
         point_cloud = zed.point_cloud
 
-        t_cam_cube = None
-        # TODO
-        
+        # Get camera-to-robot transformation
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        if t_cam_robot is None:
+            return
+
+        # Estimate cube pose from point cloud
+        result = get_transform_cube([cv_image, point_cloud], camera_intrinsic, t_cam_robot)
+        if result is None:
+            return
+        t_robot_cube, t_cam_cube = result
+
         # Visualization
         draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
         cv2.namedWindow('Verifying Cube Pose', cv2.WINDOW_NORMAL)
@@ -76,7 +156,11 @@ def main():
         if key == ord('k'):
             cv2.destroyAllWindows()
 
-            # TODO
+            # Grasp the cube
+            grasp_cube(arm, t_robot_cube)
+
+            # Place the cube back down
+            place_cube(arm, t_robot_cube)
     
     finally:
         # Close Lite6 Robot
