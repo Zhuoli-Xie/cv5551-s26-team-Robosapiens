@@ -23,7 +23,7 @@ class CubePoseDetector:
     COLOR_RANGES = {
         'red':   [( numpy.array([0, 100, 100]),   numpy.array([10, 255, 255])  ),
                   ( numpy.array([160, 100, 100]), numpy.array([180, 255, 255]) )],
-        'blue':  [( numpy.array([100, 100, 100]), numpy.array([130, 255, 255]) )],
+        'blue': [( numpy.array([100, 60, 50]), numpy.array([130, 255, 255]) )]，
         'green': [( numpy.array([40, 80, 80]),    numpy.array([80, 255, 255])  )],
     }
 
