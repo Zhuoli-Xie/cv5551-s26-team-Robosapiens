@@ -1,91 +1,106 @@
-import open3d as o3d
-import numpy as np
 import cv2
+import numpy as np
+import open3d as o3d
 
-def estimate_cube_pose(rgb_img, depth_img, intrinsic_matrix):
+# --- Constants ---
+CUBE_SIZE = 0.0205 
+COLOR_RANGES = {
+    'blue': ((100, 100, 50), (130, 255, 255)), # Adjusted for better sensitivity
+}
+
+def _get_color_mask(rgb_image, target_color='blue'):
+    hsv = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2HSV)
+    lower, upper = COLOR_RANGES.get(target_color, COLOR_RANGES['blue'])
+    mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+    # Clean up noise
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+def estimate_cube_pose_camera_frame(cv_image, point_cloud, target_color='blue'):
     """
-    输入:
-        rgb_img: (H, W, 3) np.uint8
-        depth_img: (H, W) np.float32 (单位通常为米)
-        intrinsic_matrix: 相机内参 3x3
-    输出:
-        pose: 4x4 变换矩阵 (T_camera_cube)
+    Directly estimates the cube pose in the Camera Coordinate System.
     """
-    # 1. 将 RGB-D 转换为点云
-    # 创建 Open3D 图像对象
-    color = o3d.geometry.Image(rgb_img)
-    depth = o3d.geometry.Image(depth_img)
-    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-        color, depth, convert_rgb_to_intensity=False)
+    # 1. Get the color mask
+    mask = _get_color_mask(cv_image, target_color)
     
-    pinhole_intrinsics = o3d.camera.PinholeCameraIntrinsic()
-    pinhole_intrinsics.set_intrinsics(
-        width=rgb_img.shape[1], height=rgb_img.shape[0],
-        fx=intrinsic_matrix[0, 0], fy=intrinsic_matrix[1, 1],
-        cx=intrinsic_matrix[0, 2], cy=intrinsic_matrix[1, 2]
-    )
-    
-    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, pinhole_intrinsics)
-    
-    # 2. 预处理：下采样和去噪
-    pcd = pcd.voxel_down_sample(voxel_size=0.002) # 2mm 采样
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    # DEBUG: Show the mask to ensure the cube is actually being "seen"
+    # cv2.imshow("Debug Mask", mask)
 
-    # 3. 平面分割 (RANSAC) - 寻找并移除桌面
-    plane_model, inliers = pcd.segment_plane(distance_threshold=0.01,
-                                             ransac_n=3,
-                                             num_iterations=1000)
-    # 提取桌面以上的点
-    pcd_objects = pcd.select_by_index(inliers, invert=True)
-
-    # 4. 欧式聚类 - 找到立方体
-    # eps 为聚类半径，min_points 为最少点数
-    labels = np.array(pcd_objects.cluster_dbscan(eps=0.01, min_points=10))
+    # 2. Extract points from the Point Cloud using the mask
+    # ZED point_cloud is (H, W, 4) -> [X, Y, Z, Color]
+    points_xyz = point_cloud[:, :, :3].reshape(-1, 3)
+    flat_mask = mask.reshape(-1) > 0
     
-    if len(labels) == 0:
-        print("未发现物体")
+    # Filter points: must be in mask AND must be valid numbers (not NaN)
+    valid_indices = np.isfinite(points_xyz).all(axis=1) & flat_mask
+    cube_points = points_xyz[valid_indices]
+
+    print(f"Points found for {target_color}: {cube_points.shape[0]}")
+
+    if cube_points.shape[0] < 50:
         return None
 
-    # 假设场景中最大的独立物体就是正方体（或根据尺寸 0.0205m 过滤）
-    max_label = labels.max()
-    cube_pcd = None
-    for i in range(max_label + 1):
-        cluster = pcd_objects.select_by_index(np.where(labels == i)[0])
-        obb = cluster.get_oriented_bounding_box()
-        # 验证边长是否接近 0.0205m (允许一定误差)
-        extents = obb.extent
-        if np.allclose(extents, 0.0205, atol=0.008): 
-            cube_pcd = cluster
-            break
+    # 3. Use Open3D for geometric fitting
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(cube_points)
+    
+    # Remove statistical noise (stray pixels)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.5)
+    
+    # Cluster the points to ensure we only pick the actual cube, not background noise
+    labels = np.array(pcd.cluster_dbscan(eps=0.01, min_points=10))
+    if labels.size == 0 or labels.max() < 0:
+        return None
+    
+    # Pick the largest cluster
+    largest_cluster_idx = np.argmax(np.bincount(labels[labels >= 0]))
+    final_cube_pcd = pcd.select_by_index(np.where(labels == largest_cluster_idx)[0])
+
+    # 4. Compute the Oriented Bounding Box (OBB)
+    obb = final_cube_pcd.get_oriented_bounding_box()
+    
+    # Build the 4x4 Transformation Matrix T_cam_cube
+    t_cam_cube = np.eye(4)
+    t_cam_cube[:3, :3] = obb.R
+    t_cam_cube[:3, 3] = obb.center
+
+    # 5. Fix Orientation (Optional but recommended for consistent axes)
+    # Ensure the local Z-axis of the OBB points roughly towards the camera
+    if t_cam_cube[2, 3] > 0: # Cube center is in front of camera
+        # This is a simple right-hand check
+        if np.linalg.det(t_cam_cube[:3, :3]) < 0:
+            t_cam_cube[:3, 2] *= -1
             
-    if cube_pcd is None:
-        print("未匹配到符合尺寸的正方体")
-        return None
+    return t_cam_cube
 
-    # 5. 提取位姿 (OBB)
-    cube_obb = cube_pcd.get_oriented_bounding_box()
-    cube_obb.color = (1, 0, 0) # 红色可视化
-    
-    # 构造 4x4 变换矩阵
-    rotation = cube_obb.R
-    translation = cube_obb.center
-    
-    pose = np.eye(4)
-    pose[:3, :3] = rotation
-    pose[:3, 3] = translation
+def main():
+    zed = ZedCamera()
+    camera_intrinsic = zed.camera_intrinsic
 
-    # 6. 可视化
-    origin = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
-    # 物体局部坐标系
-    cube_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.02)
-    cube_frame.transform(pose)
-    
-    o3d.visualization.draw_geometries([pcd, cube_obb, cube_frame, origin], 
-                                      window_name="Cube Pose Estimation")
-    
-    return pose
+    while True:
+        img = zed.image
+        pcd_data = zed.point_cloud
+        
+        if img is None or pcd_data is None:
+            continue
 
-# --- 使用示例 ---
-# K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-# pose = estimate_cube_pose(rgb, depth, K)
-# print("Cube Pose Matrix:\n", pose)
+        vis_img = img.copy()
+        
+        # Calculate pose ONLY relative to the camera
+        t_cam_cube = estimate_cube_pose_camera_frame(img, pcd_data, 'blue')
+
+        if t_cam_cube is not None:
+            # Draw the axes
+            # Ensure your draw_pose_axes function uses cv2.projectPoints internally
+            draw_pose_axes(vis_img, camera_intrinsic, t_cam_cube)
+        else:
+            cv2.putText(vis_img, "NOT DETECTED", (50, 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        cv2.imshow("Camera Frame Pose", vis_img)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    zed.close()
+    cv2.destroyAllWindows()
