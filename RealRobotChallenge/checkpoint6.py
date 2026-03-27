@@ -170,13 +170,6 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose, cube_prompt, 
     T_robot_cam = numpy.linalg.inv(camera_pose)
     t_robot_cube = T_robot_cam @ t_cam_cube
 
-    # ------------------------------------------------------------------ #
-    # 6. Clamp Z to table surface + cube height so grasping is consistent.
-    #    The PnP translation estimates the top-face centre; we trust X,Y
-    #    from vision and fix Z using the known geometry.
-    # ------------------------------------------------------------------ #
-    t_robot_cube[2, 3] = table_z_robot + CUBE_SIZE   # top of cube
-
     return t_robot_cube, t_cam_cube
 
 
