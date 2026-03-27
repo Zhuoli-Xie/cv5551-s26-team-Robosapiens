@@ -1,82 +1,72 @@
 import cv2
 import numpy as np
-import open3d as o3d
+from utils.zed_camera import ZedCamera
 
 # --- Constants ---
 CUBE_SIZE = 0.0205 
-COLOR_RANGES = {
-    'blue': ((100, 100, 50), (130, 255, 255)), # Adjusted for better sensitivity
-}
+# Define Blue range (Adjust these if your cube is not detected)
+BLUE_LOWER = np.array([100, 100, 50])
+BLUE_UPPER = np.array([130, 255, 255])
 
-def _get_color_mask(rgb_image, target_color='blue'):
-    hsv = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2HSV)
-    lower, upper = COLOR_RANGES.get(target_color, COLOR_RANGES['blue'])
-    mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
-    # Clean up noise
+def get_cube_pose_opencv(cv_image, point_cloud, intrinsic_matrix):
+    """
+    Estimate cube pose using only OpenCV and Numpy.
+    """
+    # 1. Color Segmentation
+    hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER)
+    
+    # Clean noise
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    return mask
 
-def estimate_cube_pose_camera_frame(cv_image, point_cloud, target_color='blue'):
-    """
-    Directly estimates the cube pose in the Camera Coordinate System.
-    """
-    # 1. Get the color mask
-    mask = _get_color_mask(cv_image, target_color)
+    # 2. Extract 3D Points from ZED Point Cloud
+    # point_cloud shape is (H, W, 4) -> [X, Y, Z, RGBA]
+    points_xyz = point_cloud[:, :, :3]
     
-    # DEBUG: Show the mask to ensure the cube is actually being "seen"
-    # cv2.imshow("Debug Mask", mask)
-
-    # 2. Extract points from the Point Cloud using the mask
-    # ZED point_cloud is (H, W, 4) -> [X, Y, Z, Color]
-    points_xyz = point_cloud[:, :, :3].reshape(-1, 3)
-    flat_mask = mask.reshape(-1) > 0
+    # Get coordinates where mask is white and depth is valid
+    valid_depth = np.isfinite(points_xyz).all(axis=2)
+    combined_mask = (mask > 0) & valid_depth
     
-    # Filter points: must be in mask AND must be valid numbers (not NaN)
-    valid_indices = np.isfinite(points_xyz).all(axis=1) & flat_mask
-    cube_points = points_xyz[valid_indices]
+    cube_points = points_xyz[combined_mask]
 
-    print(f"Points found for {target_color}: {cube_points.shape[0]}")
-
-    if cube_points.shape[0] < 50:
+    if len(cube_points) < 50:
         return None
 
-    # 3. Use Open3D for geometric fitting
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(cube_points)
+    # 3. PCA (Principal Component Analysis) to find Pose
+    # Mean of points is the Center (Translation)
+    center = np.mean(cube_points, axis=0)
     
-    # Remove statistical noise (stray pixels)
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.5)
+    # Center the data
+    centered_points = cube_points - center
     
-    # Cluster the points to ensure we only pick the actual cube, not background noise
-    labels = np.array(pcd.cluster_dbscan(eps=0.01, min_points=10))
-    if labels.size == 0 or labels.max() < 0:
-        return None
+    # Calculate Covariance Matrix
+    cov = np.cov(centered_points.T)
     
-    # Pick the largest cluster
-    largest_cluster_idx = np.argmax(np.bincount(labels[labels >= 0]))
-    final_cube_pcd = pcd.select_by_index(np.where(labels == largest_cluster_idx)[0])
+    # Eigenvectors are the principal axes (Rotation)
+    eigenvalues, eigenvectors = np.linalg.eig(cov)
+    
+    # Sort eigenvectors by eigenvalues (descending)
+    sort_indices = np.argsort(eigenvalues)[::-1]
+    R = eigenvectors[:, sort_indices]
 
-    # 4. Compute the Oriented Bounding Box (OBB)
-    obb = final_cube_pcd.get_oriented_bounding_box()
-    
-    # Build the 4x4 Transformation Matrix T_cam_cube
-    t_cam_cube = np.eye(4)
-    t_cam_cube[:3, :3] = obb.R
-    t_cam_cube[:3, 3] = obb.center
+    # Ensure Right-Handed Coordinate System
+    if np.linalg.det(R) < 0:
+        R[:, 2] *= -1
 
-    # 5. Fix Orientation (Optional but recommended for consistent axes)
-    # Ensure the local Z-axis of the OBB points roughly towards the camera
-    if t_cam_cube[2, 3] > 0: # Cube center is in front of camera
-        # This is a simple right-hand check
-        if np.linalg.det(t_cam_cube[:3, :3]) < 0:
-            t_cam_cube[:3, 2] *= -1
-            
-    return t_cam_cube
+    # 4. Prepare for OpenCV Drawing
+    # We need rvec (rotation vector) and tvec (translation vector)
+    rvec, _ = cv2.Rodrigues(R)
+    tvec = center.reshape(3, 1)
+
+    return rvec, tvec
 
 def main():
     zed = ZedCamera()
-    camera_intrinsic = zed.camera_intrinsic
+    # Ensure intrinsic is float64 for OpenCV functions
+    K = zed.camera_intrinsic.astype(np.float64)
+
+    print("Running... Press 'q' to quit.")
 
     while True:
         img = zed.image
@@ -87,20 +77,32 @@ def main():
 
         vis_img = img.copy()
         
-        # Calculate pose ONLY relative to the camera
-        t_cam_cube = estimate_cube_pose_camera_frame(img, pcd_data, 'blue')
+        # Estimate Pose
+        result = get_cube_pose_opencv(img, pcd_data, K)
 
-        if t_cam_cube is not None:
-            # Draw the axes
-            # Ensure your draw_pose_axes function uses cv2.projectPoints internally
-            draw_pose_axes(vis_img, camera_intrinsic, t_cam_cube)
+        if result is not None:
+            rvec, tvec = result
+            
+            # --- OpenCV Built-in Drawing ---
+            # Arguments: image, camera_matrix, dist_coeffs, rvec, tvec, axis_length
+            # axis_length set to 0.03m (3cm)
+            cv2.drawFrameAxes(vis_img, K, None, rvec, tvec, 0.03)
+            
+            # Optional: Print distance
+            dist = np.linalg.norm(tvec)
+            cv2.putText(vis_img, f"Dist: {dist:.3f}m", (20, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         else:
-            cv2.putText(vis_img, "NOT DETECTED", (50, 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.putText(vis_img, "Cube Not Found", (20, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        cv2.imshow("Camera Frame Pose", vis_img)
+        cv2.imshow("OpenCV Only Pose Estimation", vis_img)
+        
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     zed.close()
     cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
