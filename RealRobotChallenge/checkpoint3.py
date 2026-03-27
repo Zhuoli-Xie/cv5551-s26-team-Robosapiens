@@ -11,20 +11,84 @@ from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, CUBE_TAG_FAMILY,
 cube_prompt = 'blue cube'
 robot_ip = ''
 
+
+def find_color_ranges(image):
+    """
+    打印图像中红、蓝、绿像素的实际 HSV 范围，并输出建议的 COLOR_RANGES。
+    把三个颜色的方块都放在画面里，跑一次即可。
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+
+    # 用宽松范围捞出大概属于该颜色的像素
+    loose = {
+        'red_low':  (numpy.array([0,   20, 20]), numpy.array([15,  255, 255])),
+        'red_high': (numpy.array([150, 20, 20]), numpy.array([180, 255, 255])),
+        'blue':     (numpy.array([75,  20, 20]), numpy.array([145, 255, 255])),
+        'green':    (numpy.array([30,  20, 20]), numpy.array([90,  255, 255])),
+    }
+
+    print("=" * 50)
+    print("COLOR RANGE DETECTION RESULTS")
+    print("=" * 50)
+
+    for name, (lo, hi) in loose.items():
+        mask = cv2.inRange(hsv, lo, hi)
+        count = numpy.count_nonzero(mask)
+        if count > 0:
+            print(f"[{name}] pixels: {count}")
+            print(f"  H: {h[mask > 0].min()} - {h[mask > 0].max()}")
+            print(f"  S: {s[mask > 0].min()} - {s[mask > 0].max()}")
+            print(f"  V: {v[mask > 0].min()} - {v[mask > 0].max()}")
+        else:
+            print(f"[{name}] no pixels found")
+
+    print("\n" + "=" * 50)
+    print("SUGGESTED COLOR_RANGES (copy into your class):")
+    print("=" * 50 + "\n")
+
+    for color, keys in [('red', ['red_low', 'red_high']), ('blue', ['blue']), ('green', ['green'])]:
+        ranges = []
+        for k in keys:
+            lo, hi = loose[k]
+            mask = cv2.inRange(hsv, lo, hi)
+            if numpy.count_nonzero(mask) > 0:
+                h_min, h_max = int(h[mask > 0].min()), int(h[mask > 0].max())
+                s_min, s_max = int(s[mask > 0].min()), int(s[mask > 0].max())
+                v_min, v_max = int(v[mask > 0].min()), int(v[mask > 0].max())
+                # 留点余量
+                h_min = max(0, h_min - 5)
+                h_max = min(180, h_max + 5)
+                s_min = max(0, s_min - 10)
+                v_min = max(0, v_min - 10)
+                ranges.append(
+                    f"(numpy.array([{h_min}, {s_min}, {v_min}]), numpy.array([{h_max}, 255, 255]))"
+                )
+        if ranges:
+            print(f"'{color}': [{', '.join(ranges)}],")
+        else:
+            print(f"'{color}': [],  # no pixels detected")
+
+    print()
+
+
 class CubePoseDetector:
     """
     A detector to robustly identify and locate a specific cube in the scene.
 
-    This class leverages text prompts to semantically segment a specific cube (e.g., 
+    This class leverages text prompts to semantically segment a specific cube (e.g.,
     'blue cube') and determine the cube's pose by the AprilTags.
     """
 
     # HSV color ranges for each cube color
+    # 如果检测不到，先跑 find_color_ranges() 获取实际范围再替换这里
     COLOR_RANGES = {
-        'red':   [( numpy.array([0, 100, 100]),   numpy.array([10, 255, 255])  ),
-                  ( numpy.array([160, 100, 100]), numpy.array([180, 255, 255]) )],
-        'blue': [( numpy.array([100, 60, 50]), numpy.array([130, 255, 255]) )],
-        'green': [( numpy.array([40, 80, 80]),    numpy.array([80, 255, 255])  )],
+        'red':   [(numpy.array([0,   30, 30]), numpy.array([15,  255, 255])),
+                  (numpy.array([155, 30, 30]), numpy.array([180, 255, 255]))],
+        'blue':  [(numpy.array([80,  30, 30]), numpy.array([140, 255, 255]))],
+        'green': [(numpy.array([30,  20, 20]), numpy.array([90,  255, 255]))],
     }
 
     def __init__(self, camera_intrinsic):
@@ -53,35 +117,16 @@ class CubePoseDetector:
         return None
 
     def _get_color_mask(self, image, color):
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    
-    # --- 调试：打印整张图里所有像素的 HSV 分布 ---
-    h_channel = hsv[:,:,0]
-    s_channel = hsv[:,:,1]
-    v_channel = hsv[:,:,2]
-    
-    # 先用一个宽松范围找到"大概是蓝色"的像素
-    loose_mask = cv2.inRange(hsv, numpy.array([80, 30, 30]), numpy.array([140, 255, 255]))
-    if loose_mask.sum() > 0:
-        print(f"Loose blue pixels found: {loose_mask.sum() // 255}")
-        print(f"  H range: {h_channel[loose_mask > 0].min()} - {h_channel[loose_mask > 0].max()}")
-        print(f"  S range: {s_channel[loose_mask > 0].min()} - {s_channel[loose_mask > 0].max()}")
-        print(f"  V range: {v_channel[loose_mask > 0].min()} - {v_channel[loose_mask > 0].max()}")
-    else:
-        print("No blue-ish pixels found even with loose range!")
-        # 试试打印全图 H 值分布
-        unique, counts = numpy.unique(h_channel, return_counts=True)
-        top10 = sorted(zip(counts, unique), reverse=True)[:10]
-        print("Top 10 H values:", [(int(h), int(c)) for c, h in top10])
-    # --- 调试结束 ---
-    
-    mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
-    for lower, upper in self.COLOR_RANGES[color]:
-        mask |= cv2.inRange(hsv, lower, upper)
-    kernel = numpy.ones((5, 5), numpy.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    return mask
+        """Create a binary mask for the specified color using HSV thresholding."""
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
+        for lower, upper in self.COLOR_RANGES[color]:
+            mask |= cv2.inRange(hsv, lower, upper)
+        # Clean up the mask
+        kernel = numpy.ones((5, 5), numpy.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        return mask
 
     def get_transforms(self, observation, cube_prompt):
         """
@@ -180,6 +225,7 @@ class CubePoseDetector:
 
         return t_robot_cube, t_cam_cube
 
+
 def main():
 
     # Initialize ZED Camera
@@ -203,6 +249,14 @@ def main():
         # Get Observation
         cv_image = zed.image
 
+        # --- 调试：检测颜色范围（确认后可注释掉） ---
+        if cv_image.shape[2] == 4:
+            bgr_debug = cv2.cvtColor(cv_image, cv2.COLOR_BGRA2BGR)
+        else:
+            bgr_debug = cv_image
+        find_color_ranges(bgr_debug)
+        # --- 调试结束 ---
+
         # Get camera-to-robot transformation
         t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
         if t_cam_robot is None:
@@ -221,7 +275,7 @@ def main():
         cv2.resizeWindow('Verifying Cube Pose', 1280, 720)
         cv2.imshow('Verifying Cube Pose', cv_image)
         key = cv2.waitKey(0)
-    
+
         if key == ord('k'):
             cv2.destroyAllWindows()
 
@@ -230,7 +284,7 @@ def main():
 
             # Place the cube back down
             place_cube(arm, t_robot_cube)
-            
+
     finally:
         # Close Lite6 Robot
         arm.move_gohome(wait=True)
@@ -239,6 +293,7 @@ def main():
 
         # Close ZED Camera
         zed.close()
+
 
 if __name__ == "__main__":
     main()
