@@ -47,10 +47,26 @@ def _get_color_mask(hsv_image, color):
     return mask
 
 
+def _order_box_corners(box_points):
+    """
+    用 sum/diff 方法稳定排序 4 个角点为：左上、右上、右下、左下。
+    比按 y 排序更鲁棒，不会因为旋转角度导致顺序错乱。
+    """
+    s = box_points.sum(axis=1)         # x + y
+    d = numpy.diff(box_points, axis=1).flatten()  # y - x
+
+    tl = box_points[numpy.argmin(s)]   # 左上：x+y 最小
+    br = box_points[numpy.argmax(s)]   # 右下：x+y 最大
+    tr = box_points[numpy.argmin(d)]   # 右上：y-x 最小
+    bl = box_points[numpy.argmax(d)]   # 左下：y-x 最大
+
+    return numpy.array([tl, tr, br, bl], dtype=numpy.float64)
+
+
 def get_transform_cube(observation, camera_intrinsic, camera_pose, cube_prompt='blue cube'):
     """
-    用颜色分割找到方块轮廓，把轮廓上所有点映射到方块顶面 3D 坐标，
-    再用 solvePnP 估计方块位姿。
+    用颜色分割找到方块轮廓，用稳定的角点排序 + solvePnP 估计位姿，
+    再用全部轮廓点精化。
 
     Parameters
     ----------
@@ -86,8 +102,6 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose, cube_prompt='
 
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     color_mask = _get_color_mask(hsv, color)
-
-    # 保存 mask 用于调试
     cv2.imwrite("color_mask_debug.png", color_mask)
 
     # --- 找轮廓 ---
@@ -96,7 +110,6 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose, cube_prompt='
         print(f"No contours found for {color}.")
         return None
 
-    # 过滤太小的轮廓（噪声），选最大的
     min_area = 100
     valid_contours = [c for c in contours if cv2.contourArea(c) > min_area]
     if not valid_contours:
@@ -105,116 +118,128 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose, cube_prompt='
 
     largest_contour = max(valid_contours, key=cv2.contourArea)
     area = cv2.contourArea(largest_contour)
-    print(f"Found {color} contour: area={area:.0f} pixels, points={len(largest_contour)}")
+    print(f"Found {color} contour: area={area:.0f}px, points={len(largest_contour)}")
 
-    # --- 用 minAreaRect 建立局部坐标系 ---
+    # --- minAreaRect + 稳定角点排序 ---
     rect = cv2.minAreaRect(largest_contour)
     center_2d, (w_px, h_px), angle = rect
+    print(f"  minAreaRect: center={center_2d}, size=({w_px:.1f}, {h_px:.1f}), angle={angle:.1f}")
 
     if w_px < 1 or h_px < 1:
         print("minAreaRect too small.")
         return None
 
-    # 确保 w_px >= h_px（让宽边一致）
-    if w_px < h_px:
-        w_px, h_px = h_px, w_px
-        angle += 90
+    box = cv2.boxPoints(rect)
+    corners_2d = _order_box_corners(box)  # 左上、右上、右下、左下
 
-    # 调试：画出检测到的矩形
+    # 调试：画角点和编号
     debug_img = bgr.copy()
-    box_pts = cv2.boxPoints(rect).astype(int)
-    cv2.drawContours(debug_img, [box_pts], 0, (0, 255, 0), 2)
     cv2.drawContours(debug_img, [largest_contour], 0, (255, 0, 0), 1)
-    cv2.circle(debug_img, (int(center_2d[0]), int(center_2d[1])), 5, (0, 0, 255), -1)
-    cv2.imwrite("detected_rect_debug.png", debug_img)
+    cv2.drawContours(debug_img, [box.astype(int)], 0, (0, 255, 0), 2)
+    labels = ['TL', 'TR', 'BR', 'BL']
+    for i, (pt, label) in enumerate(zip(corners_2d, labels)):
+        cv2.circle(debug_img, (int(pt[0]), int(pt[1])), 6, (0, 0, 255), -1)
+        cv2.putText(debug_img, label, (int(pt[0]) + 8, int(pt[1]) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    cv2.imwrite("detected_corners_debug.png", debug_img)
 
-    # --- 把轮廓上所有点映射到方块顶面 3D 坐标 ---
-    contour_points = largest_contour.reshape(-1, 2).astype(numpy.float64)
-
-    # 旋转矩阵：图像坐标 → 矩形局部坐标
-    angle_rad = numpy.deg2rad(angle)
-    cos_a = numpy.cos(angle_rad)
-    sin_a = numpy.sin(angle_rad)
-    rot_mat = numpy.array([[cos_a, sin_a], [-sin_a, cos_a]])
-
-    # 中心化 + 旋转到局部坐标
-    centered = contour_points - numpy.array(center_2d)
-    local_coords = (rot_mat @ centered.T).T  # (N, 2)
-
-    # 归一化到方块实际尺寸
+    # --- 第一步：4 角点 solvePnP (IPPE_SQUARE) ---
     half = CUBE_SIZE / 2
-    local_coords[:, 0] = local_coords[:, 0] / w_px * CUBE_SIZE
-    local_coords[:, 1] = local_coords[:, 1] / h_px * CUBE_SIZE
-
-    # 限制在方块范围内（去掉边缘噪声点）
-    within_bounds = (
-        (numpy.abs(local_coords[:, 0]) <= half * 1.1) &
-        (numpy.abs(local_coords[:, 1]) <= half * 1.1)
-    )
-    local_coords = local_coords[within_bounds]
-    contour_points = contour_points[within_bounds]
-
-    local_coords[:, 0] = numpy.clip(local_coords[:, 0], -half, half)
-    local_coords[:, 1] = numpy.clip(local_coords[:, 1], -half, half)
-
-    if len(local_coords) < 4:
-        print("Too few points after filtering.")
-        return None
-
-    # 3D 点：轮廓对应方块顶面，z=0
-    object_points = numpy.zeros((len(local_coords), 3), dtype=numpy.float64)
-    object_points[:, 0] = local_coords[:, 0]
-    object_points[:, 1] = local_coords[:, 1]
-    # z = 0（方块顶面）
-
-    image_points = contour_points.astype(numpy.float64)
-
-    print(f"  Using {len(image_points)} points for solvePnP")
-
-    # --- solvePnP ---
-    # 先用 4 角点 IPPE 初始化，再用全部点 ITERATIVE 精化
-    box_corners = cv2.boxPoints(rect).astype(numpy.float64)
-    # 排序角点
-    sorted_by_y = box_corners[numpy.argsort(box_corners[:, 1])]
-    top = sorted_by_y[:2]
-    bottom = sorted_by_y[2:]
-    top = top[numpy.argsort(top[:, 0])]
-    bottom = bottom[numpy.argsort(bottom[:, 0])]
-    corners_ordered = numpy.array([top[0], top[1], bottom[1], bottom[0]], dtype=numpy.float64)
-
-    corner_3d = numpy.array([
-        [-half,  half, 0],
-        [ half,  half, 0],
-        [ half, -half, 0],
-        [-half, -half, 0],
+    # 3D 角点对应顺序：左上、右上、右下、左下（方块顶面，z=0）
+    corners_3d = numpy.array([
+        [-half,  half, 0],   # TL
+        [ half,  half, 0],   # TR
+        [ half, -half, 0],   # BR
+        [-half, -half, 0],   # BL
     ], dtype=numpy.float64)
 
-    # 初始估计
     success, rvec_init, tvec_init = cv2.solvePnP(
-        corner_3d, corners_ordered, camera_intrinsic, None,
+        corners_3d, corners_2d, camera_intrinsic, None,
         flags=cv2.SOLVEPNP_IPPE_SQUARE
     )
-
     if not success:
-        print("Initial solvePnP (IPPE) failed.")
+        print("Initial solvePnP (IPPE_SQUARE) failed.")
         return None
 
-    # 用全部轮廓点精化
-    success, rvec, tvec = cv2.solvePnP(
-        object_points, image_points, camera_intrinsic, None,
-        rvec=rvec_init, tvec=tvec_init, useExtrinsicGuess=True,
-        flags=cv2.SOLVEPNP_ITERATIVE
-    )
+    # 验证初始估计：z 应该为正（方块在相机前方）
+    if tvec_init[2, 0] < 0:
+        print(f"  Warning: initial tvec z={tvec_init[2, 0]:.4f} is negative, flipping.")
+        tvec_init = -tvec_init
 
-    if not success:
-        print("Refined solvePnP (ITERATIVE) failed, using initial estimate.")
+    # 初始重投影误差
+    proj_init, _ = cv2.projectPoints(corners_3d, rvec_init, tvec_init, camera_intrinsic, None)
+    err_init = numpy.linalg.norm(proj_init.reshape(-1, 2) - corners_2d, axis=1)
+    print(f"  Initial PnP reprojection error: mean={err_init.mean():.2f}px, max={err_init.max():.2f}px")
+
+    # --- 第二步：用全部轮廓点精化 ---
+    contour_points = largest_contour.reshape(-1, 2).astype(numpy.float64)
+
+    # 用初始 rvec/tvec 反投影，把 2D 轮廓点映射到方块顶面 z=0 平面
+    R_init, _ = cv2.Rodrigues(rvec_init)
+    t_init = tvec_init.flatten()
+    K_inv = numpy.linalg.inv(camera_intrinsic)
+
+    object_points_list = []
+    image_points_list = []
+
+    for pt_2d in contour_points:
+        # 像素点 → 归一化相机坐标
+        p_homo = numpy.array([pt_2d[0], pt_2d[1], 1.0])
+        ray_cam = K_inv @ p_homo  # 相机坐标系下的射线方向
+
+        # 射线与方块顶面 z=0 平面求交
+        # 方块坐标系下：P = R^T @ (lambda * ray_cam - t)
+        # 令 P_z = 0，解 lambda
+        ray_obj = R_init.T @ ray_cam
+        t_obj = R_init.T @ t_init
+
+        if abs(ray_obj[2]) < 1e-8:
+            continue  # 射线几乎平行于平面，跳过
+
+        lam = t_obj[2] / ray_obj[2]
+        if lam < 0:
+            continue  # 在相机后方，跳过
+
+        p_obj = lam * ray_obj - t_obj
+        p_obj[2] = 0.0  # 强制在 z=0 平面上
+
+        # 过滤超出方块范围的点（留 20% 余量）
+        if abs(p_obj[0]) > half * 1.2 or abs(p_obj[1]) > half * 1.2:
+            continue
+
+        object_points_list.append(p_obj)
+        image_points_list.append(pt_2d)
+
+    if len(object_points_list) < 4:
+        print(f"  Too few points for refinement ({len(object_points_list)}), using initial estimate.")
         rvec, tvec = rvec_init, tvec_init
+    else:
+        obj_pts = numpy.array(object_points_list, dtype=numpy.float64)
+        img_pts = numpy.array(image_points_list, dtype=numpy.float64)
 
-    R, _ = cv2.Rodrigues(rvec)
+        print(f"  Refining with {len(obj_pts)} contour points")
+
+        success_ref, rvec, tvec = cv2.solvePnP(
+            obj_pts, img_pts, camera_intrinsic, None,
+            rvec=rvec_init.copy(), tvec=tvec_init.copy(),
+            useExtrinsicGuess=True,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+
+        if not success_ref:
+            print("  Refined solvePnP failed, using initial estimate.")
+            rvec, tvec = rvec_init, tvec_init
+        else:
+            # 精化后重投影误差
+            proj_ref, _ = cv2.projectPoints(obj_pts, rvec, tvec, camera_intrinsic, None)
+            err_ref = numpy.linalg.norm(proj_ref.reshape(-1, 2) - img_pts, axis=1)
+            print(f"  Refined reprojection error: mean={err_ref.mean():.2f}px, max={err_ref.max():.2f}px")
+
+    R_final, _ = cv2.Rodrigues(rvec)
 
     # 构建 t_cam_cube
     t_cam_cube = numpy.eye(4)
-    t_cam_cube[:3, :3] = R
+    t_cam_cube[:3, :3] = R_final
     t_cam_cube[:3, 3] = tvec.flatten()
 
     print(f"  Cube in camera frame: {tvec.flatten()}")
@@ -224,12 +249,6 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose, cube_prompt='
     t_robot_cube = t_robot_cam @ t_cam_cube
 
     print(f"  Cube in robot frame:  {t_robot_cube[:3, 3]}")
-
-    # --- 验证：重投影误差 ---
-    projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_intrinsic, None)
-    projected = projected.reshape(-1, 2)
-    errors = numpy.linalg.norm(projected - image_points, axis=1)
-    print(f"  Reprojection error: mean={errors.mean():.2f}px, max={errors.max():.2f}px")
 
     return t_robot_cube, t_cam_cube
 
