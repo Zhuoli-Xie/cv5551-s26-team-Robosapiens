@@ -23,7 +23,7 @@ class CubePoseDetector:
     COLOR_RANGES = {
         'red':   [( numpy.array([0, 100, 100]),   numpy.array([10, 255, 255])  ),
                   ( numpy.array([160, 100, 100]), numpy.array([180, 255, 255]) )],
-        'blue': [( numpy.array([100, 60, 50]), numpy.array([130, 255, 255]) )]，
+        'blue': [( numpy.array([100, 60, 50]), numpy.array([130, 255, 255]) )],
         'green': [( numpy.array([40, 80, 80]),    numpy.array([80, 255, 255])  )],
     }
 
@@ -53,16 +53,35 @@ class CubePoseDetector:
         return None
 
     def _get_color_mask(self, image, color):
-        """Create a binary mask for the specified color using HSV thresholding."""
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
-        for lower, upper in self.COLOR_RANGES[color]:
-            mask |= cv2.inRange(hsv, lower, upper)
-        # Clean up the mask
-        kernel = numpy.ones((5, 5), numpy.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        return mask
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    
+    # --- 调试：打印整张图里所有像素的 HSV 分布 ---
+    h_channel = hsv[:,:,0]
+    s_channel = hsv[:,:,1]
+    v_channel = hsv[:,:,2]
+    
+    # 先用一个宽松范围找到"大概是蓝色"的像素
+    loose_mask = cv2.inRange(hsv, numpy.array([80, 30, 30]), numpy.array([140, 255, 255]))
+    if loose_mask.sum() > 0:
+        print(f"Loose blue pixels found: {loose_mask.sum() // 255}")
+        print(f"  H range: {h_channel[loose_mask > 0].min()} - {h_channel[loose_mask > 0].max()}")
+        print(f"  S range: {s_channel[loose_mask > 0].min()} - {s_channel[loose_mask > 0].max()}")
+        print(f"  V range: {v_channel[loose_mask > 0].min()} - {v_channel[loose_mask > 0].max()}")
+    else:
+        print("No blue-ish pixels found even with loose range!")
+        # 试试打印全图 H 值分布
+        unique, counts = numpy.unique(h_channel, return_counts=True)
+        top10 = sorted(zip(counts, unique), reverse=True)[:10]
+        print("Top 10 H values:", [(int(h), int(c)) for c, h in top10])
+    # --- 调试结束 ---
+    
+    mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
+    for lower, upper in self.COLOR_RANGES[color]:
+        mask |= cv2.inRange(hsv, lower, upper)
+    kernel = numpy.ones((5, 5), numpy.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
 
     def get_transforms(self, observation, cube_prompt):
         """
