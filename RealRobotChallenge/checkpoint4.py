@@ -9,9 +9,9 @@ from utils.zed_camera import ZedCamera
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH
 
 # TODO
-STACK_HEIGHT = 0.026   # Determine a suitable height yourself
+STACK_HEIGHT = 0.025   # Determine a suitable height yourself
 
-robot_ip = ''
+robot_ip = '192.168.1.182'
 
 def main():
 
@@ -35,8 +35,9 @@ def main():
     try:
         # Get Observation
         cv_image = zed.image
-        t_robot_red, t_cam_red = cube_pose_detector.get_transforms(cv_image, 'red cube')
-        t_robot_green, t_cam_green = cube_pose_detector.get_transforms(cv_image, 'green cube')
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        t_robot_red, t_cam_red = cube_pose_detector.get_transforms(cv_image, 'red cube',t_cam_robot)
+        t_robot_green, t_cam_green = cube_pose_detector.get_transforms(cv_image, 'green cube',t_cam_robot)
 
         grasp_cube(arm, t_robot_red)
         time.sleep(0.5)
