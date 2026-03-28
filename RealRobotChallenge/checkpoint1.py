@@ -12,7 +12,7 @@ CUBE_TAG_FAMILY = 'tag36h11'
 CUBE_TAG_ID = 4
 CUBE_TAG_SIZE = 0.0207
 
-robot_ip = ''
+robot_ip = '192.168.1.183'
 
 def grasp_cube(arm, cube_pose):
     """
@@ -26,8 +26,36 @@ def grasp_cube(arm, cube_pose):
         A 4x4 transformation matrix representing the cube's pose in the robot base frame.
         All translational units in this matrix are in meters.
     """
-    # TODO
-    pass
+    # Extract position (meters -> mm)
+    x = cube_pose[0, 3] * 1000
+    y = cube_pose[1, 3] * 1000
+    z = cube_pose[2, 3] * 1000
+
+    # Extract yaw from cube orientation for gripper alignment
+    rot = Rotation.from_matrix(cube_pose[:3, :3])
+    _, _, yaw = rot.as_euler('xyz', degrees=True)
+
+    PRE_GRASP_HEIGHT = 100  # mm above the cube
+
+    # Open gripper
+    arm.open_lite6_gripper()
+    time.sleep(0.5)
+
+    # Move to pre-grasp position (safe height above cube)
+    arm.set_position(x, y, z + PRE_GRASP_HEIGHT, 180, 0, yaw, wait=True)
+    time.sleep(0.3)
+
+    # Descend to grasp position
+    arm.set_position(x, y, z, 180, 0, yaw, wait=True)
+    time.sleep(0.3)
+
+    # Close gripper to grasp
+    arm.close_lite6_gripper()
+    time.sleep(0.5)
+
+    # Lift up to safe height
+    arm.set_position(x, y, z + PRE_GRASP_HEIGHT, 180, 0, yaw, wait=True)
+    time.sleep(0.3)
 
 def place_cube(arm, cube_pose):
     """
@@ -41,8 +69,32 @@ def place_cube(arm, cube_pose):
         A 4x4 transformation matrix representing the target placement pose in the robot base frame.
         All translational units in this matrix are in meters.
     """
-    # TODO
-    pass
+    # Extract position (meters -> mm)
+    x = cube_pose[0, 3] * 1000
+    y = cube_pose[1, 3] * 1000
+    z = cube_pose[2, 3] * 1000
+
+    # Extract yaw from cube orientation
+    rot = Rotation.from_matrix(cube_pose[:3, :3])
+    _, _, yaw = rot.as_euler('xyz', degrees=True)
+
+    PRE_PLACE_HEIGHT = 100  # mm above the placement position
+
+    # Move to pre-place position (safe height)
+    arm.set_position(x, y, z + PRE_PLACE_HEIGHT, 180, 0, yaw, wait=True)
+    time.sleep(0.3)
+
+    # Descend to place position
+    arm.set_position(x, y, z, 180, 0, yaw, wait=True)
+    time.sleep(0.3)
+
+    # Open gripper to release
+    arm.open_lite6_gripper()
+    time.sleep(0.5)
+
+    # Lift up to safe height
+    arm.set_position(x, y, z + PRE_PLACE_HEIGHT, 180, 0, yaw, wait=True)
+    time.sleep(0.3)
 
 def get_transform_cube(observation, camera_intrinsic, camera_pose):
     """
@@ -69,8 +121,55 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
         are 4x4 transformation matrices with translations in meters. 
         If no cube tag is detected, returns None.
     """
-    # TODO
-    pass
+    detector = Detector(families=CUBE_TAG_FAMILY)
+
+    # Convert to grayscale if needed
+    if len(observation.shape) > 2:
+        gray = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY)
+    else:
+        gray = observation
+
+    # Detect AprilTags
+    tags = detector.detect(gray, estimate_tag_pose=False)
+
+    # Find the cube tag (ID = CUBE_TAG_ID)
+    cube_tag = None
+    for tag in tags:
+        if tag.tag_id == CUBE_TAG_ID:
+            cube_tag = tag
+            break
+
+    if cube_tag is None:
+        print('Cube tag not found.')
+        return None
+
+    # Define 3D corner coordinates of the tag in its local frame (z=0)
+    # Corner order matches pupil_apriltags: bottom-left, bottom-right, top-right, top-left
+    half = CUBE_TAG_SIZE / 2
+    object_points = numpy.array([
+        [-half,  half, 0],
+        [-half, -half, 0],
+        [ half, -half, 0],
+        [ half,  half, 0],
+    ], dtype=numpy.float64)
+
+    image_points = cube_tag.corners.astype(numpy.float64)
+
+    # Solve PnP to get tag pose in camera frame
+    success, rvec, tvec = cv2.solvePnP(object_points, image_points, camera_intrinsic, None)
+    if not success:
+        print('PnP failed for cube tag.')
+        return None
+
+    rmat, _ = cv2.Rodrigues(rvec)
+    t_cam_cube = numpy.eye(4)
+    t_cam_cube[:3, :3] = rmat
+    t_cam_cube[:3, 3] = tvec.flatten()
+
+    # Transform cube pose from camera frame to robot base frame
+    t_robot_cube = numpy.linalg.inv(camera_pose) @ t_cam_cube
+
+    return t_robot_cube, t_cam_cube
 
 def main():
 
@@ -97,9 +196,12 @@ def main():
         if t_cam_robot is None:
             return
         
-        t_cam_cube = None
-        # TODO
-        
+        # Estimate cube pose
+        result = get_transform_cube(cv_image, camera_intrinsic, t_cam_robot)
+        if result is None:
+            return
+        t_robot_cube, t_cam_cube = result
+
         # Visualization
         draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
         cv2.namedWindow('Verifying Cube Pose', cv2.WINDOW_NORMAL)
@@ -110,7 +212,11 @@ def main():
         if key == ord('k'):
             cv2.destroyAllWindows()
 
-            # TODO
+            # Grasp the cube
+            grasp_cube(arm, t_robot_cube)
+
+            # Place the cube back down
+            place_cube(arm, t_robot_cube)
     
     finally:
         # Close Lite6 Robot
