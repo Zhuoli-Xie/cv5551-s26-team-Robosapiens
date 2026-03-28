@@ -8,23 +8,64 @@ from utils.zed_camera import ZedCamera
 from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, CUBE_TAG_FAMILY, CUBE_TAG_ID, CUBE_TAG_SIZE
 
-cube_prompt = 'blue cube'
-robot_ip = '192.168.1.183'  # 别忘了填入你的 xArm IP
+cube_prompt = 'green cube'
+robot_ip = '192.168.1.183'
+
+COLOR_RANGES = {
+    'blue':   ((100, 80, 50), (130, 255, 255)),
+    'red':    ((0, 80, 50), (10, 255, 255)),     # red wraps around; second range added in code
+    'red2':   ((170, 80, 50), (180, 255, 255)),   # upper red hue range
+    'green':  ((40, 80, 50), (80, 255, 255)),
+    'yellow': ((20, 80, 50), (40, 255, 255)),
+    'orange': ((10, 80, 50), (20, 255, 255)),
+    }
+
+def _parse_color(cube_prompt):
+    """Extract the color keyword from a cube prompt string."""
+    prompt_lower = cube_prompt.lower()
+    for color in COLOR_RANGES:
+        if color.endswith('2'):
+            continue
+        if color in prompt_lower:
+            return color
+    return None
+
+def _get_color_mask(hsv_image, color):
+    """Create a binary mask for the given color in HSV space."""
+    lower, upper = COLOR_RANGES[color]
+    mask = cv2.inRange(hsv_image, numpy.array(lower), numpy.array(upper))
+    # Red wraps around hue=0/180, so combine both ranges
+    if color == 'red' and 'red2' in COLOR_RANGES:
+        lower2, upper2 = COLOR_RANGES['red2']
+        mask2 = cv2.inRange(hsv_image, numpy.array(lower2), numpy.array(upper2))
+        mask = cv2.bitwise_or(mask, mask2)
+    # Clean up noise
+    kernel = numpy.ones((5, 5), numpy.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
 
 class CubePoseDetector:
     """
     A detector to robustly identify and locate a specific cube in the scene.
+
+    This class leverages text prompts to semantically segment a specific cube (e.g., 
+    'blue cube') and determine the cube's pose by the AprilTags.
     """
 
     # HSV color ranges for each cube color
-    COLOR_RANGES = {
-        'red':   [( numpy.array([0, 100, 100]),   numpy.array([10, 255, 255])  ),
-                  ( numpy.array([160, 100, 100]), numpy.array([180, 255, 255]) )],
-        'blue':  [( numpy.array([100, 60, 50]),   numpy.array([130, 255, 255]) )], # 修复了中文逗号
-        'green': [( numpy.array([40, 80, 80]),    numpy.array([80, 255, 255])  )],
-    }
+
 
     def __init__(self, camera_intrinsic):
+        """
+        Initialize the CubePoseDetector with camera parameters.
+
+        Parameters
+        ----------
+        camera_intrinsic : numpy.ndarray
+            The 3x3 intrinsic camera matrix.
+        """
         self.camera_intrinsic = camera_intrinsic
         self.detector = Detector(families=CUBE_TAG_FAMILY)
         self.t_cam_robot = None
@@ -33,97 +74,96 @@ class CubePoseDetector:
         """Store the camera-to-robot transformation."""
         self.t_cam_robot = t_cam_robot
 
-    def _parse_color(self, cube_prompt):
-        """Extract the color name from the text prompt."""
-        prompt_lower = cube_prompt.lower()
-        for color in self.COLOR_RANGES:
-            if color in prompt_lower:
-                return color
-        return None
-
-    def _get_color_mask(self, image, color):
-        """Create a binary mask for the specified color using HSV thresholding."""
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
-        for lower, upper in self.COLOR_RANGES[color]:
-            mask |= cv2.inRange(hsv, lower, upper)
-        
-        # Clean up the mask (形态学开闭运算去噪)
-        kernel = numpy.ones((5, 5), numpy.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        return mask
-
     def get_transforms(self, observation, cube_prompt):
-        """Calculate the transformation matrix for a specific prompted cube."""
-        color = self._parse_color(cube_prompt)
-        if color is None:
-            print(f"Could not parse color from prompt: '{cube_prompt}'")
-            return None
+        """
+        Calculate the transformation matrix for a specific prompted cube relative to the robot base frame,
+        as well as relative to the camera frame.
 
-        # Prepare BGR image for color detection
-        if len(observation.shape) == 2:
-            print('Color image required for color detection.')
-            return None
-        if observation.shape[2] == 4:
-            bgr_image = cv2.cvtColor(observation, cv2.COLOR_BGRA2BGR)
+        Parameters
+        ----------
+        observation : numpy.ndarray
+            The input image from the camera. Can be a color (BGRA/BGR) or grayscale image.
+        cube_prompt : str
+            The text prompt used to segment the target object (e.g., 'blue cube').
+
+        Returns
+        -------
+        tuple or None
+            If successful, returns a tuple (t_robot_cube, t_cam_cube) where both
+            are 4x4 transformation matrices with translations in meters.
+            If no matching object or tag is found, returns None.
+        """
+        # Parse target color from prompt
+        if len(observation.shape) > 2:
+            gray = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY)
         else:
-            bgr_image = observation
-
-        # Create color mask
-        mask = self._get_color_mask(bgr_image, color)
-        # cv2.imwrite("mask.png", mask) # 取消注释可用于调试掩膜生成情况
+            gray = observation
 
         # Detect all AprilTags
-        gray = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY) if len(observation.shape) > 2 else observation
         tags = self.detector.detect(gray, estimate_tag_pose=False)
-        
         if not tags:
             print("No AprilTags detected.")
             return None
 
-        # --- 回滚到版本1的稳健匹配逻辑 (区域积分法) ---
-        target_tag = None
+        # Determine which cube corresponds to the cube prompt by HSV color thresholding
+        color = _parse_color(cube_prompt)
+        if color is None:
+            print(f"Could not parse color from prompt: '{cube_prompt}'")
+            return None
+
+        # Convert observation to BGR then HSV for color matching
+        if len(observation.shape) > 2 and observation.shape[2] == 4:
+            bgr = cv2.cvtColor(observation, cv2.COLOR_BGRA2BGR)
+        elif len(observation.shape) > 2:
+            bgr = observation
+        else:
+            print("Grayscale image cannot be used for color matching.")
+            return None
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        color_mask = _get_color_mask(hsv, color)
+
+        # Find the tag whose center overlaps most with the color mask
+        cube_tag = None
         best_score = 0
         region_radius = 30  # pixels around tag center to sample
 
         for tag in tags:
             cx, cy = int(tag.center[0]), int(tag.center[1])
-            h, w = mask.shape[:2]
+            # Extract a small region around the tag center
+            h, w = color_mask.shape[:2]
             y1 = max(0, cy - region_radius)
             y2 = min(h, cy + region_radius)
             x1 = max(0, cx - region_radius)
             x2 = min(w, cx + region_radius)
-            
-            region = mask[y1:y2, x1:x2]
+            region = color_mask[y1:y2, x1:x2]
             score = numpy.count_nonzero(region)
-            
             if score > best_score:
                 best_score = score
-                target_tag = tag
+                cube_tag = tag
 
-        if target_tag is None or best_score == 0:
+        if cube_tag is None or best_score == 0:
             print(f"No cube matching '{cube_prompt}' found.")
             return None
 
-        print(f'Matched tag ID {target_tag.tag_id} for {color} cube')
-
-        # --- 回滚到版本1正确的PnP解算逻辑 ---
+        # Prepare 3D world coordinates of cube tag corners (in cube frame)
+        # pupil_apriltags corner order: TL, TR, BR, BL
         s = CUBE_TAG_SIZE
         half = s / 2
-        # 注意：这里的角点顺序必须是 TL, TR, BR, BL 才能正确对应 V1 的解算
-        object_points = numpy.array([
+
+        world_points = numpy.array([
             [-half,  half, 0],   # TL
             [ half,  half, 0],   # TR
             [ half, -half, 0],   # BR
             [-half, -half, 0],   # BL
         ], dtype=float)
 
-        image_points = numpy.array(target_tag.corners, dtype=float)
+        # 2D image points
+        image_points = numpy.array(cube_tag.corners, dtype=float)
 
-        # 恢复使用 SOLVEPNP_IPPE_SQUARE 算法
+        # SolvePnP to get cube pose in camera frame
         success, rvec, tvec = cv2.solvePnP(
-            object_points,
+            world_points,
             image_points,
             self.camera_intrinsic,
             None,
@@ -131,20 +171,24 @@ class CubePoseDetector:
         )
 
         if not success:
-            print('PnP failed for target cube.')
+            print("PnP failed for cube.")
             return None
 
-        rmat, _ = cv2.Rodrigues(rvec)
+        R, _ = cv2.Rodrigues(rvec)
+
+        # Build T_cam_cube
         t_cam_cube = numpy.eye(4)
-        t_cam_cube[:3, :3] = rmat
+        t_cam_cube[:3, :3] = R
         t_cam_cube[:3, 3] = tvec.flatten()
 
-        # Transform to robot frame
-        t_robot_cube = numpy.linalg.inv(self.t_cam_robot) @ t_cam_cube
+        # Convert to robot frame
+        T_robot_cam = numpy.linalg.inv(self.t_cam_robot)
+        t_robot_cube = T_robot_cam @ t_cam_cube
 
         return t_robot_cube, t_cam_cube
 
 def main():
+
     # Initialize ZED Camera
     zed = ZedCamera()
     camera_intrinsic = zed.camera_intrinsic
@@ -175,7 +219,6 @@ def main():
         # Detect target cube pose
         result = cube_pose_detector.get_transforms(cv_image, cube_prompt)
         if result is None:
-            print("Failed to detect the target cube.")
             return
         t_robot_cube, t_cam_cube = result
 
@@ -185,14 +228,13 @@ def main():
         cv2.resizeWindow('Verifying Cube Pose', 1280, 720)
         cv2.imshow('Verifying Cube Pose', cv_image)
         key = cv2.waitKey(0)
-        
+    
         if key == ord('k'):
             cv2.destroyAllWindows()
 
             # Grasp the target cube
             grasp_cube(arm, t_robot_cube)
-            time.sleep(1.0)
-            
+
             # Place the cube back down
             place_cube(arm, t_robot_cube)
             
