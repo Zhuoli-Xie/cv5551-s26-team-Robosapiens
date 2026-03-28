@@ -7,9 +7,9 @@ from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, get_transform_cube, GRIPPER_LENGTH
 
 # TODO
-BASKET_POSE = None # Measure it using the robot's free drive mode.
+BASKET_POSE = [230.7, -297.2, 122.8, 3.14159, 0, 0] # Measure it using the robot's free drive mode.
 
-robot_ip = ''
+robot_ip = '192.168.1.182'
 
 def place_in_basket(arm, basket_pose, vaccum_gripper=False):
     """
@@ -28,8 +28,30 @@ def place_in_basket(arm, basket_pose, vaccum_gripper=False):
         If True, uses the vacuum gripper logic instead of the standard Lite6 
         gripper. Defaults to False.
     """
-    # TODO
-    pass
+    # Extract basket pose (meters -> mm, radians -> degrees)
+    x = basket_pose[0] 
+    y = basket_pose[1] 
+    z = basket_pose[2] 
+    roll = numpy.degrees(basket_pose[3])
+    pitch = numpy.degrees(basket_pose[4])
+    yaw = numpy.degrees(basket_pose[5])
+
+    DROP_HEIGHT = 60  # mm above basket to clear the lip
+
+    # Move to safe height above the basket
+    arm.set_position(x, y, z + DROP_HEIGHT, roll, pitch, yaw, wait=True)
+    time.sleep(0.3)
+
+    # Release the cube
+    if vaccum_gripper:
+        arm.set_vacuum_gripper(False)
+    else:
+        arm.open_lite6_gripper()
+    time.sleep(0.5)
+
+    # Lift up after releasing
+    arm.set_position(x, y, z + DROP_HEIGHT + 50, roll, pitch, yaw, wait=True)
+    time.sleep(0.3)
 
 def main():
 
@@ -51,9 +73,17 @@ def main():
         # Get Observation
         cv_image = zed.image
 
-        t_cam_cube = None
-        #TODO
-        
+        # Get camera-to-robot transformation
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        if t_cam_robot is None:
+            return
+
+        # Estimate cube pose
+        result = get_transform_cube(cv_image, camera_intrinsic, t_cam_robot)
+        if result is None:
+            return
+        t_robot_cube, t_cam_cube = result
+
         # Visualization
         draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
         cv2.namedWindow('Verifying Cube Pose', cv2.WINDOW_NORMAL)
@@ -64,7 +94,11 @@ def main():
         if key == ord('k'):
             cv2.destroyAllWindows()
 
-            # TODO
+            # Grasp the cube
+            grasp_cube(arm, t_robot_cube)
+
+            # Place the cube into the basket
+            place_in_basket(arm, BASKET_POSE)
     
     finally:
         # Close Lite6 Robot
