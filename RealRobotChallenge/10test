@@ -1,0 +1,100 @@
+from checkpoint8 import CubePoseDetector
+
+import cv2, numpy, time
+from xarm.wrapper import XArmAPI
+
+from utils.vis_utils import draw_pose_axes
+from utils.zed_camera import ZedCamera
+from checkpoint0 import get_transform_camera_robot
+from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH
+from checkpoint4 import STACK_HEIGHT
+
+stacking_order = ['red cube', 'green cube', 'blue cube']
+robot_ip = '192.168.1.158'
+
+def main():
+
+    # Initialize ZED Camera
+    zed = ZedCamera()
+    camera_intrinsic = zed.camera_intrinsic
+
+    # Initialize Cube Pose Detector
+    cube_pose_detector = CubePoseDetector(camera_intrinsic)
+
+    # Initialize Lite6 Robot
+    arm = XArmAPI(robot_ip)
+    arm.connect()
+    arm.motion_enable(enable=True)
+    arm.set_tcp_offset([0, 0, GRIPPER_LENGTH, 0, 0, 0])
+    arm.set_mode(0)
+    arm.set_state(0)
+    arm.move_gohome(wait=True)
+    time.sleep(0.5)
+
+    try:
+        # Step 1: Get initial camera-to-robot transform (only once, to avoid segfault from repeated Detector creation)
+        cv_image = zed.image
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        if t_cam_robot is None:
+            print("Failed to get camera-to-robot transform.")
+            return
+
+        # Step 2: Detect the first cube as the base (don't move it)
+        time.sleep(0.5)
+        cv_image = zed.image
+        point_cloud = zed.point_cloud
+
+        base_prompt = stacking_order[0]
+        result = cube_pose_detector.get_transforms([cv_image, point_cloud], base_prompt, t_cam_robot)
+        if result is None:
+            print(f"Base cube '{base_prompt}' not found.")
+            return
+        base_pose, _ = result
+        print(f"Base cube: {base_prompt}, position (m): {base_pose[:3, 3]}")
+
+        # Step 3: Stack remaining cubes on top of the base
+        for i, cube_prompt in enumerate(stacking_order[1:], start=1):
+            # Re-capture image and point cloud (scene has changed)
+            time.sleep(0.5)
+            cv_image = zed.image
+            point_cloud = zed.point_cloud
+
+            result = cube_pose_detector.get_transforms([cv_image, point_cloud], cube_prompt, t_cam_robot)
+            if result is None:
+                print(f"Cube '{cube_prompt}' not found, stopping.")
+                break
+
+            t_robot_cube, _ = result
+            print(f"Picking up: {cube_prompt}, position (m): {t_robot_cube[:3, 3]}")
+
+            # Grasp the cube
+            grasp_cube(arm, t_robot_cube)
+            time.sleep(0.5)
+
+            # Calculate target placement: base XY + stacked height
+            target_pose = base_pose.copy()
+            target_pose[2, 3] += i * STACK_HEIGHT
+
+            # Place on top of the tower
+            place_cube(arm, target_pose)
+            time.sleep(0.5)
+
+            print(f"Stacked cube #{i + 1}: {cube_prompt}")
+
+            # Return to home before next cycle
+            arm.move_gohome(wait=True)
+            time.sleep(1.0)
+
+        print(f"Tower complete!")
+
+    finally:
+        # Close Lite6 Robot
+        arm.move_gohome(wait=True)
+        time.sleep(0.5)
+        arm.disconnect()
+
+        # Close ZED Camera
+        zed.close()
+
+if __name__ == "__main__":
+    main()
