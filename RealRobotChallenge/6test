@@ -1,0 +1,161 @@
+import cv2, numpy, time, torch
+import open3d as o3d
+from scipy.spatial.transform import Rotation
+from xarm.wrapper import XArmAPI
+
+from utils.vis_utils import draw_pose_axes
+from utils.zed_camera import ZedCamera
+from checkpoint0 import get_transform_camera_robot
+from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH
+
+CUBE_SIZE = 0.025
+
+robot_ip = '192.168.1.183'
+
+def get_transform_cube(observation, camera_intrinsic, camera_pose):
+    """
+    Estimate the 6D pose of the cube in the robot base frame.
+    """
+    image, point_cloud = observation
+
+    if len(image.shape) > 2 and image.shape[2] == 4:
+        bgr = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    else:
+        bgr = image.copy()
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    lower_red1 = numpy.array([0, 100, 50])
+    upper_red1 = numpy.array([10, 255, 255])
+    lower_red2 = numpy.array([170, 100, 50])
+    upper_red2 = numpy.array([180, 255, 255])
+
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    kernel = numpy.ones((5, 5), numpy.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # Only keep the largest contour to avoid noise from other red objects
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        print("No red regions found.")
+        return None
+    largest_contour = max(contours, key=cv2.contourArea)
+    mask = numpy.zeros_like(mask)
+    cv2.drawContours(mask, [largest_contour], -1, 255, -1)
+
+    cube_points = point_cloud[mask == 255]
+
+    if cube_points.shape[1] == 4:
+        cube_points = cube_points[:, :3]
+
+    valid_mask = ~numpy.isnan(cube_points).any(axis=1) & ~numpy.isinf(cube_points).any(axis=1)
+    valid_points = cube_points[valid_mask]
+
+    # ZED point cloud is in millimeters, convert to meters
+    valid_points = valid_points / 1000.0
+
+    if len(valid_points) < 50:
+        print(f"Not enough valid points: {len(valid_points)}")
+        return None
+
+    # Remove statistical outliers for cleaner point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(valid_points)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+    if len(pcd.points) < 50:
+        print("Not enough points after outlier removal.")
+        return None
+
+    # 位置：XY 均值，Z 取顶面均值 + 半个方块高度 = 方块几何中心
+    points = numpy.asarray(pcd.points)
+    center_x = numpy.mean(points[:, 0])
+    center_y = numpy.mean(points[:, 1])
+    top_z = numpy.mean(points[:, 2])
+    center_z = top_z + CUBE_SIZE / 2.0
+
+    # 旋转：从2D轮廓最小面积矩形获取 yaw（比平面点云 OBB 更稳定）
+    rect = cv2.minAreaRect(largest_contour)
+    angle_rad = numpy.radians(rect[2])
+    cos_a = numpy.cos(angle_rad)
+    sin_a = numpy.sin(angle_rad)
+    R = numpy.array([
+        [cos_a, -sin_a, 0],
+        [sin_a,  cos_a, 0],
+        [0,      0,     1]
+    ])
+
+    t_cam_cube = numpy.eye(4)
+    t_cam_cube[:3, :3] = R
+    t_cam_cube[:3, 3] = [center_x, center_y, center_z]
+
+    print(f"Cube center in camera frame (m): [{center_x:.4f}, {center_y:.4f}, {center_z:.4f}], top_z: {top_z:.4f}")
+
+    T_robot_cam = numpy.linalg.inv(camera_pose)
+    t_robot_cube = T_robot_cam @ t_cam_cube
+
+    print(f"Cube center in robot frame (m): {t_robot_cube[:3, 3]}")
+
+    return t_robot_cube, t_cam_cube
+
+def main():
+
+    # Initialize ZED Camera
+    zed = ZedCamera()
+    camera_intrinsic = zed.camera_intrinsic
+
+    # Initialize Lite6 Robot
+    arm = XArmAPI(robot_ip)
+    arm.connect()
+    arm.motion_enable(enable=True)
+    arm.set_tcp_offset([0, 0, GRIPPER_LENGTH, 0, 0, 0])
+    arm.set_mode(0)
+    arm.set_state(0)
+    arm.move_gohome(wait=True)
+    time.sleep(0.5)
+
+    try:
+        # Get Observation
+        cv_image = zed.image
+        point_cloud = zed.point_cloud
+
+        t_cam_cube = None
+        
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        if t_cam_robot is None:
+            return
+        
+        result = get_transform_cube([cv_image, point_cloud], camera_intrinsic, t_cam_robot)
+        if result is None:
+            return
+        t_robot_cube, t_cam_cube = result
+
+        # Visualization (size=0.025 matches cube size ~25mm)
+        draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube, size=CUBE_SIZE)
+        cv2.namedWindow('Verifying Cube Pose', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Verifying Cube Pose', 1280, 720)
+        cv2.imshow('Verifying Cube Pose', cv_image)
+        key = cv2.waitKey(0)
+
+        if key == ord('k'):
+            cv2.destroyAllWindows()
+
+            
+            grasp_cube(arm, t_robot_cube)
+            time.sleep(1.0)
+            place_cube(arm, t_robot_cube)
+    
+    finally:
+        # Close Lite6 Robot
+        arm.move_gohome(wait=True)
+        time.sleep(0.5)
+        arm.disconnect()
+
+        # Close ZED Camera
+        zed.close()
+
+if __name__ == "__main__":
+    main()
