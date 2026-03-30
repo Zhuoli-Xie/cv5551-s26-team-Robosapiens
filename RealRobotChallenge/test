@@ -1,0 +1,14 @@
+[SDK][ERROR][2026-03-30 16:09:23][base.py:423] - - wait_feedback, xarm is stop, state=4
+ControllerError, code: 22
+[SDK][ERROR][2026-03-30 16:09:24][base.py:423] - - API -> set_position -> code=1, pos=[-293260.376385733, -242870.54385163743, -397223.019446254, 3.141592653589793, 0.0, 1.4204003380082066], radius=-1, velo=100.0, acc=2000
+[SDK][ERROR][2026-03-30 16:09:24][base.py:423] - - API -> set_tgpio_digital(ionum=0, value=0) -> code=1
+[SDK][ERROR][2026-03-30 16:09:24][base.py:423] - - API -> set_tgpio_digital(ionum=1, value=1) -> code=1
+[SDK][ERROR][2026-03-30 16:09:25][base.py:423] - - API -> set_position -> code=1, pos=[-293260.376385733, -242870.54385163743, -397123.019446254, 3.141592653589793, 0.0, 1.4204003380082066], radius=-1, velo=100.0, acc=2000
+[SDK][ERROR][2026-03-30 16:09:26][base.py:423] - - API -> set_position -> code=1, pos=[-293260.376385733, -242870.54385163743, -397123.019446254, 3.141592653589793, 0.0, 1.4204003380082066], radius=-1, velo=100.0, acc=2000
+[SDK][ERROR][2026-03-30 16:09:26][base.py:423] - - API -> set_position -> code=1, pos=[-293260.376385733, -242870.54385163743, -397223.019446254, 3.141592653589793, 0.0, 1.4204003380082066], radius=-1, velo=100.0, acc=2000
+[SDK][ERROR][2026-03-30 16:09:26][base.py:423] - - API -> set_tgpio_digital(ionum=0, value=1) -> code=1
+[SDK][ERROR][2026-03-30 16:09:26][base.py:423] - - API -> set_tgpio_digital(ionum=1, value=0) -> code=1
+[SDK][ERROR][2026-03-30 16:09:27][base.py:423] - - API -> set_position -> code=1, pos=[-293260.376385733, -242870.54385163743, -397123.019446254, 3.141592653589793, 0.0, 1.4204003380082066], radius=-1, velo=100.0, acc=2000
+[SDK][ERROR][2026-03-30 16:09:27][base.py:423] - - API -> move_gohome -> code=1, velo=0.3490658503988659, acc=8.726646259971648
+(rob) rob@rob-00:~/robotics5551$ A^C
+(rob) rob@rob-00:~/robotics5551$ 
