@@ -130,19 +130,34 @@ class CubePoseDetector:
             print(f"离群点移除后 '{cube_prompt}' 点云不足。")
             return None
 
-        # 6. 使用 Open3D 计算有向包围盒 (OBB) 得到位姿
-        obb = pcd.get_oriented_bounding_box()
+        # 6. 计算方块位姿
+        points = numpy.asarray(pcd.points)
 
-        # 确保 OBB 旋转矩阵是正确的旋转矩阵 (det = +1)
-        R = numpy.array(obb.R)
-        if numpy.linalg.det(R) < 0:
-            R[:, 2] *= -1
+        # 6a. 位置：用点云 XY 均值作为中心，Z 取最小值（顶面）再加半个方块高度得到真正中心
+        center_x = numpy.mean(points[:, 0])
+        center_y = numpy.mean(points[:, 1])
+        top_z = numpy.mean(points[:, 2])  # 顶面 Z（相机坐标系中 Z 是深度）
+        center_z = top_z + CUBE_SIZE / 2.0  # 顶面往深处偏移半个方块 = 方块几何中心
+
+        # 6b. 旋转：从2D轮廓的最小面积矩形获取 yaw（比 OBB 在平面点云上更稳定）
+        rect = cv2.minAreaRect(largest_contour)
+        angle_deg = rect[2]  # OpenCV minAreaRect 角度
+        angle_rad = numpy.radians(angle_deg)
+
+        # 构建相机坐标系下的旋转矩阵（只绕 Z 轴旋转）
+        cos_a = numpy.cos(angle_rad)
+        sin_a = numpy.sin(angle_rad)
+        R = numpy.array([
+            [cos_a, -sin_a, 0],
+            [sin_a,  cos_a, 0],
+            [0,      0,     1]
+        ])
 
         t_cam_cube = numpy.eye(4)
         t_cam_cube[:3, :3] = R
-        t_cam_cube[:3, 3] = numpy.array(obb.center)
+        t_cam_cube[:3, 3] = [center_x, center_y, center_z]
 
-        print(f"[{cube_prompt}] center in cam (m): {obb.center}, extent (m): {obb.extent}")
+        print(f"[{cube_prompt}] center in cam (m): [{center_x:.4f}, {center_y:.4f}, {center_z:.4f}], top_z: {top_z:.4f}")
 
         # 6. 如果没有传入 t_cam_robot，则当场计算一下
         if t_cam_robot is None:
