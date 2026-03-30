@@ -28,7 +28,7 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     upper_red1 = numpy.array([10, 255, 255])
     lower_red2 = numpy.array([170, 100, 50])
     upper_red2 = numpy.array([180, 255, 255])
-    
+
     mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
     mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
     mask = cv2.bitwise_or(mask1, mask2)
@@ -37,8 +37,17 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
+    # Only keep the largest contour to avoid noise from other red objects
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        print("No red regions found.")
+        return None
+    largest_contour = max(contours, key=cv2.contourArea)
+    mask = numpy.zeros_like(mask)
+    cv2.drawContours(mask, [largest_contour], -1, 255, -1)
+
     cube_points = point_cloud[mask == 255]
-    
+
     if cube_points.shape[1] == 4:
         cube_points = cube_points[:, :3]
 
@@ -48,49 +57,38 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     # ZED point cloud is in millimeters, convert to meters
     valid_points = valid_points / 1000.0
 
-    if len(valid_points) < 10:
+    if len(valid_points) < 50:
+        print(f"Not enough valid points: {len(valid_points)}")
         return None
 
+    # Remove statistical outliers for cleaner point cloud
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points)
-    
-    # ====== 新增修复逻辑开始 ======
-    
-    # 1. 统计滤波：剔除空气中的离群散点
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=15, std_ratio=2.0)
-    
-    if len(pcd.points) < 10:
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+    if len(pcd.points) < 50:
+        print("Not enough points after outlier removal.")
         return None
 
-    # 2. DBSCAN 聚类：分离方块与桌面反光
-    # eps=0.02 表示：点与点之间距离超过 2cm 就认为它们不是同一个物体
-    labels = numpy.array(pcd.cluster_dbscan(eps=0.02, min_points=10))
-    
-    if len(labels) == 0 or labels.max() < 0:
-        print("聚类失败，未找到密集的方块点云")
-        return None
-        
-    # 找出点数最多的一簇（即真正的方块），丢弃其他噪点簇
-    unique_labels, counts = numpy.unique(labels[labels >= 0], return_counts=True)
-    largest_label = unique_labels[numpy.argmax(counts)]
-    cube_indices = numpy.where(labels == largest_label)[0]
-    final_cube_pcd = pcd.select_by_index(cube_indices)
-    
-    # ====== 新增修复逻辑结束 ======
+    # Use OBB to get pose
+    obb = pcd.get_oriented_bounding_box()
 
-    # 用过滤后干净的点云计算 OBB
-    obb = final_cube_pcd.get_oriented_bounding_box()
-    center = obb.center  
-    rotation = obb.R     
+    # Ensure OBB rotation is a proper rotation matrix (det = +1)
+    R = numpy.array(obb.R)
+    if numpy.linalg.det(R) < 0:
+        R[:, 2] *= -1
 
     t_cam_cube = numpy.eye(4)
-    t_cam_cube[:3, :3] = rotation
-    t_cam_cube[:3, 3] = center
+    t_cam_cube[:3, :3] = R
+    t_cam_cube[:3, 3] = numpy.array(obb.center)
 
-    # 注意：确保这里你的 camera_pose 传入的是 T_cam_robot (相机在机器人坐标系下的位姿)
-    # 如果 camera_pose 是 T_robot_cam，这里就不需要求逆了。
+    print(f"Cube center in camera frame (m): {obb.center}")
+    print(f"OBB extent (m): {obb.extent}")
+
     T_robot_cam = numpy.linalg.inv(camera_pose)
     t_robot_cube = T_robot_cam @ t_cam_cube
+
+    print(f"Cube center in robot frame (m): {t_robot_cube[:3, 3]}")
 
     return t_robot_cube, t_cam_cube
 
@@ -126,8 +124,8 @@ def main():
             return
         t_robot_cube, t_cam_cube = result
 
-        # Visualization
-        draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
+        # Visualization (size=0.025 matches cube size ~25mm)
+        draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube, size=CUBE_SIZE)
         cv2.namedWindow('Verifying Cube Pose', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Verifying Cube Pose', 1280, 720)
         cv2.imshow('Verifying Cube Pose', cv_image)
