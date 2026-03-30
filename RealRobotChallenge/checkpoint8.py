@@ -96,6 +96,15 @@ class CubePoseDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
+        # 2.5 只保留最大轮廓，避免噪点干扰
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) == 0:
+            print(f"未检测到 '{cube_prompt}' 的颜色区域。")
+            return None
+        largest_contour = max(contours, key=cv2.contourArea)
+        mask = numpy.zeros_like(mask)
+        cv2.drawContours(mask, [largest_contour], -1, 255, -1)
+
         # 3. 用掩膜过滤出对应的 3D 点云
         cube_points = point_cloud[mask == 255]
         if cube_points.shape[1] == 4:
@@ -105,18 +114,33 @@ class CubePoseDetector:
         valid_mask = ~numpy.isnan(cube_points).any(axis=1) & ~numpy.isinf(cube_points).any(axis=1)
         valid_points = cube_points[valid_mask]
 
+        # ZED point cloud is in millimeters, convert to meters
+        valid_points = valid_points / 1000.0
+
         if len(valid_points) < 50:
             print(f"未检测到足够的 '{cube_prompt}' 点云数据。")
             return None
 
-        # 5. 使用 Open3D 计算有向包围盒 (OBB) 得到位姿
+        # 5. 去除统计离群点，清理点云
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(valid_points)
-        obb = pcd.get_oriented_bounding_box()
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 
+        if len(pcd.points) < 50:
+            print(f"离群点移除后 '{cube_prompt}' 点云不足。")
+            return None
+
+        # 6. 计算方块位姿
+        points = numpy.asarray(pcd.points)
+
+        # 6a. 位置：点云质心（顶面中心），不在相机坐标系做 Z 补偿
+        center = numpy.mean(points, axis=0)
+
+        # 6b. 旋转：单位矩阵（抓取时只需要 yaw，由 grasp_cube 从 robot frame 提取）
         t_cam_cube = numpy.eye(4)
-        t_cam_cube[:3, :3] = obb.R
-        t_cam_cube[:3, 3] = obb.center
+        t_cam_cube[:3, 3] = center
+
+        print(f"[{cube_prompt}] center in cam (m): [{center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}]")
 
         # 6. 如果没有传入 t_cam_robot，则当场计算一下
         if t_cam_robot is None:
@@ -128,7 +152,20 @@ class CubePoseDetector:
         # 7. 将相机坐标系转换到机械臂基坐标系
         T_robot_cam = numpy.linalg.inv(t_cam_robot)
         t_robot_cube = T_robot_cam @ t_cam_cube
-    
+
+        # 8. 在机器人坐标系中补偿 Z：点云检测到的是顶面，方块中心在顶面下方半个方块
+        #    机器人坐标系 Z 轴朝上，所以减去半个方块高度
+        t_robot_cube[2, 3] -= CUBE_SIZE / 2.0
+
+        # 9. 设置旋转为朝下抓取（roll=180°, pitch=0, yaw=0）
+        t_robot_cube[:3, :3] = numpy.array([
+            [1,  0,  0],
+            [0, -1,  0],
+            [0,  0, -1]
+        ])
+
+        print(f"[{cube_prompt}] center in robot (m): {t_robot_cube[:3, 3]}")
+
         return t_robot_cube, t_cam_cube
 
 def main():
@@ -171,7 +208,7 @@ def main():
         else:
             return
         # Visualization
-        draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
+        draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube, size=CUBE_SIZE)
         cv2.namedWindow('Verifying Cube Pose', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Verifying Cube Pose', 1280, 720)
         cv2.imshow('Verifying Cube Pose', cv_image)
