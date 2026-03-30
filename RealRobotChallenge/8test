@@ -1,0 +1,224 @@
+import cv2, numpy, time
+import open3d as o3d
+from scipy.spatial.transform import Rotation
+from xarm.wrapper import XArmAPI
+
+from utils.vis_utils import draw_pose_axes
+from utils.zed_camera import ZedCamera
+from checkpoint0 import get_transform_camera_robot
+from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH
+from checkpoint6 import CUBE_SIZE
+
+cube_prompt = 'blue cube'
+robot_ip = ''
+
+class CubePoseDetector:
+    """
+    A detector to robustly identify and locate a specific cube in the scene.
+
+    This class leverages text prompts to semantically segment a specific cube (e.g., 
+    'blue cube') and determine the cube's pose by its 3D point cloud.
+    """
+
+    def __init__(self, camera_intrinsic):
+        """
+        Initialize the CubePoseDetector with camera parameters.
+
+        Parameters
+        ----------
+        camera_intrinsic : numpy.ndarray
+            The 3x3 intrinsic camera matrix.
+        """
+        self.camera_intrinsic = camera_intrinsic
+        # TODO
+        self.color_ranges = {
+            'blue':   ((100, 80, 50), (130, 255, 255)),
+            'red':    ((0, 80, 50), (10, 255, 255)),
+            'red2':   ((170, 80, 50), (180, 255, 255)), # 红色的另一半跨度
+            'green':  ((40, 80, 50), (80, 255, 255)),
+            'yellow': ((20, 80, 50), (40, 255, 255)),
+            'orange': ((10, 80, 50), (20, 255, 255)),
+        }
+
+    def get_transforms(self, observation, cube_prompt, t_cam_robot=None):
+        """
+        Calculate the transformation matrix for a specific prompted cube relative to the robot base frame,
+        as well as relative to the camera frame.
+
+        Parameters
+        ----------
+        observation : list or tuple
+            A collection containing [image, point_cloud], where image is the 
+            RGB/BGRA array and point_cloud is the registered 3D point cloud.
+        cube_prompt : str
+            The text prompt used to segment the target object (e.g., 'blue cube').
+
+        Returns
+        -------
+        tuple or None
+            If successful, returns a tuple (t_robot_cube, t_cam_cube) where both 
+            are 4x4 transformation matrices with translations in meters. 
+            If no matching object is segmented, returns None.
+        """
+        image, point_cloud = observation
+
+        # ==================== TODO 2: 颜色分割 + 点云提取 + OBB计算 ====================
+        
+        # 1. 解析提示词，确定目标颜色
+        prompt_lower = cube_prompt.lower()
+        target_color = None
+        for color in self.color_ranges:
+            if color.replace('2', '') in prompt_lower:
+                target_color = color.replace('2', '')
+                break
+                
+        if not target_color:
+            print(f"无法从提示词中解析出支持的颜色: '{cube_prompt}'")
+            return None
+
+        # 2. 生成 HSV 颜色掩膜 (Mask)
+        if len(image.shape) > 2 and image.shape[2] == 4:
+            bgr = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        else:
+            bgr = image.copy()
+            
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        
+        lower, upper = self.color_ranges[target_color]
+        mask = cv2.inRange(hsv, numpy.array(lower), numpy.array(upper))
+        
+        if target_color == 'red':
+            lower2, upper2 = self.color_ranges['red2']
+            mask2 = cv2.inRange(hsv, numpy.array(lower2), numpy.array(upper2))
+            mask = cv2.bitwise_or(mask, mask2)
+            
+        kernel = numpy.ones((5, 5), numpy.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        # 2.5 只保留最大轮廓，避免噪点干扰
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) == 0:
+            print(f"未检测到 '{cube_prompt}' 的颜色区域。")
+            return None
+        largest_contour = max(contours, key=cv2.contourArea)
+        mask = numpy.zeros_like(mask)
+        cv2.drawContours(mask, [largest_contour], -1, 255, -1)
+
+        # 3. 用掩膜过滤出对应的 3D 点云
+        cube_points = point_cloud[mask == 255]
+        if cube_points.shape[1] == 4:
+            cube_points = cube_points[:, :3]
+
+        # 4. 滤除点云中的无效值 (NaN 和 Inf)
+        valid_mask = ~numpy.isnan(cube_points).any(axis=1) & ~numpy.isinf(cube_points).any(axis=1)
+        valid_points = cube_points[valid_mask]
+
+        # ZED point cloud is in millimeters, convert to meters
+        valid_points = valid_points / 1000.0
+
+        if len(valid_points) < 50:
+            print(f"未检测到足够的 '{cube_prompt}' 点云数据。")
+            return None
+
+        # 5. 去除统计离群点，清理点云
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(valid_points)
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+        if len(pcd.points) < 50:
+            print(f"离群点移除后 '{cube_prompt}' 点云不足。")
+            return None
+
+        # 6. 使用 Open3D 计算有向包围盒 (OBB) 得到位姿
+        obb = pcd.get_oriented_bounding_box()
+
+        # 确保 OBB 旋转矩阵是正确的旋转矩阵 (det = +1)
+        R = numpy.array(obb.R)
+        if numpy.linalg.det(R) < 0:
+            R[:, 2] *= -1
+
+        t_cam_cube = numpy.eye(4)
+        t_cam_cube[:3, :3] = R
+        t_cam_cube[:3, 3] = numpy.array(obb.center)
+
+        print(f"[{cube_prompt}] center in cam (m): {obb.center}, extent (m): {obb.extent}")
+
+        # 6. 如果没有传入 t_cam_robot，则当场计算一下
+        if t_cam_robot is None:
+            t_cam_robot = get_transform_camera_robot(image, self.camera_intrinsic)
+            if t_cam_robot is None:
+                print("获取相机与机械臂坐标系变换失败。")
+                return None
+
+        # 7. 将相机坐标系转换到机械臂基坐标系
+        T_robot_cam = numpy.linalg.inv(t_cam_robot)
+        t_robot_cube = T_robot_cam @ t_cam_cube
+    
+        return t_robot_cube, t_cam_cube
+
+def main():
+
+    # Initialize ZED Camera
+    zed = ZedCamera()
+    camera_intrinsic = zed.camera_intrinsic
+
+    # Initialize Cube Pose Detector
+    cube_pose_detector = CubePoseDetector(camera_intrinsic)
+
+    # Initialize Lite6 Robot
+    arm = XArmAPI(robot_ip)
+    arm.connect()
+    arm.motion_enable(enable=True)
+    arm.set_tcp_offset([0, 0, GRIPPER_LENGTH, 0, 0, 0])
+    arm.set_mode(0)
+    arm.set_state(0)
+    arm.move_gohome(wait=True)
+    time.sleep(0.5)
+
+    try:
+        # Get Observation
+        cv_image = zed.image
+        point_cloud = zed.point_cloud
+
+        t_cam_cube = None
+        # TODO
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        
+        if t_cam_robot is not None:
+            
+            result = cube_pose_detector.get_transforms([cv_image, point_cloud], cube_prompt, t_cam_robot)
+            
+            if result is not None:
+                t_robot_cube, t_cam_cube = result
+            else:
+                print("can't find the cube pose.")
+                return
+        else:
+            return
+        # Visualization
+        draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube, size=CUBE_SIZE)
+        cv2.namedWindow('Verifying Cube Pose', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Verifying Cube Pose', 1280, 720)
+        cv2.imshow('Verifying Cube Pose', cv_image)
+        key = cv2.waitKey(0)
+    
+        if key == ord('k'):
+            cv2.destroyAllWindows()
+
+            grasp_cube(arm, t_robot_cube)
+            time.sleep(1.0)
+
+            place_cube(arm, t_robot_cube)
+    
+    finally:
+        # Close Lite6 Robot
+        arm.move_gohome(wait=True)
+        time.sleep(0.5)
+        arm.disconnect()
+
+        # Close ZED Camera
+        zed.close()
+
+if __name__ == "__main__":
+    main()
