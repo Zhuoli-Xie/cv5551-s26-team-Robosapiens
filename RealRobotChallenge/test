@@ -1,11 +1,7 @@
 ROBOT_IP: 192.168.1.158, VERSION: v2.7.1, PROTOCOL: V1, DETAIL: 6,9,LI1006,DL1000,v2.7.1, TYPE1300: [0, 0]
 change protocol identifier to 3
-[motion_enable], xArm is not ready to move
-[set_state], xArm is ready to move
-[red cube] center in cam (m): [0.12851145 0.0657866  0.46041989], extent (m): [0.03373212 0.03351302 0.01958413]
+[red cube] center in cam (m): [0.05183004 0.02996998 0.48697409], extent (m): [0.03185963 0.02673945 0.00697078]
 Number of tags found: 2
-[green cube] center in cam (m): [-0.00162776  0.02769129  0.48754904], extent (m): [0.0334698  0.02463492 0.01311846]
-Number of tags found: 2
-[blue cube] center in cam (m): [-1.01070511 -0.39490778  1.01962755], extent (m): [0.19284123 0.11412902 0.0308319 ]
+[green cube] center in cam (m): [-0.10270083  0.02385682  0.49405622], extent (m): [0.03348136 0.02904945 0.02293919]
 Number of tags found: 2
 Segmentation fault (core dumped)
