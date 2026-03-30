@@ -1,16 +1,15 @@
 from checkpoint8 import CubePoseDetector
 
-import cv2, numpy, time
+import cv2, time
 from xarm.wrapper import XArmAPI
 
 from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
-from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH
 from checkpoint4 import STACK_HEIGHT
 
-stacking_order = ['red cube', 'green cube', 'blue cube']
-robot_ip = '192.168.1.158'
+stacking_order = ['red cube', 'green cube', 'blue cube']   # From top to bottom
+robot_ip = ''
 
 def main():
 
@@ -32,61 +31,88 @@ def main():
     time.sleep(0.5)
 
     try:
-        # Step 1: Get initial camera-to-robot transform (only once, to avoid segfault from repeated Detector creation)
-        cv_image = zed.image
-        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
-        if t_cam_robot is None:
-            print("Failed to get camera-to-robot transform.")
-            return
-
-        # Step 2: Detect the first cube as the base (don't move it)
-        time.sleep(0.5)
+        # Get Observation
         cv_image = zed.image
         point_cloud = zed.point_cloud
 
-        base_prompt = stacking_order[0]
-        result = cube_pose_detector.get_transforms([cv_image, point_cloud], base_prompt, t_cam_robot)
-        if result is None:
-            print(f"Base cube '{base_prompt}' not found.")
-            return
-        base_pose, _ = result
-        print(f"Base cube: {base_prompt}, position (m): {base_pose[:3, 3]}")
-
-        # Step 3: Stack remaining cubes on top of the base
-        for i, cube_prompt in enumerate(stacking_order[1:], start=1):
-            # Re-capture image and point cloud (scene has changed)
+        # TODO
+        print("--- 寻找红色方块 ---")
+        cv_image = zed.image
+        point_cloud = zed.point_cloud
+        result_red = cube_pose_detector.get_transforms([cv_image, point_cloud], 'red cube')
+        
+        if result_red is not None:
+            t_robot_red, _ = result_red
+            base_pose = t_robot_red.copy() # 将红色的位置记录为“地基”
+            
+            print("抓取并放置红色方块...")
+            grasp_cube(arm, t_robot_red)
             time.sleep(0.5)
-            cv_image = zed.image
-            point_cloud = zed.point_cloud
-
-            result = cube_pose_detector.get_transforms([cv_image, point_cloud], cube_prompt, t_cam_robot)
-            if result is None:
-                print(f"Cube '{cube_prompt}' not found, stopping.")
-                break
-
-            t_robot_cube, _ = result
-            print(f"Picking up: {cube_prompt}, position (m): {t_robot_cube[:3, 3]}")
-
-            # Grasp the cube
-            grasp_cube(arm, t_robot_cube)
+            place_cube(arm, base_pose)     # 放回原位作为第一层
             time.sleep(0.5)
-
-            # Calculate target placement: base XY + stacked height
-            target_pose = base_pose.copy()
-            target_pose[2, 3] += i * STACK_HEIGHT
-
-            # Place on top of the tower
-            place_cube(arm, target_pose)
-            time.sleep(0.5)
-
-            print(f"Stacked cube #{i + 1}: {cube_prompt}")
-
-            # Return to home before next cycle
             arm.move_gohome(wait=True)
             time.sleep(1.0)
+        else:
+            print("错误：未找到红色方块，程序终止。")
+            return
 
-        print(f"Tower complete!")
+        # ==========================================
+        # 步骤 2: 寻找并抓取【蓝色方块】(叠在红色上方)
+        # ==========================================
+        print("--- 寻找蓝色方块 ---")
+        # 重新获取图像，防止点云信息过期
+        cv_image = zed.image
+        point_cloud = zed.point_cloud
+        result_blue = cube_pose_detector.get_transforms([cv_image, point_cloud], 'blue cube')
+        
+        if result_blue is not None:
+            t_robot_blue, _ = result_blue
+            
+            print("抓取蓝色方块...")
+            grasp_cube(arm, t_robot_blue)
+            time.sleep(0.5)
+            
+            # 目标位置是地基（红块）的 Z 轴加上 1 个方块的高度
+            target_pose_blue = base_pose.copy()
+            target_pose_blue[2, 3] += 1 * STACK_HEIGHT
+            
+            print("放置蓝色方块...")
+            place_cube(arm, target_pose_blue)
+            time.sleep(0.5)
+            arm.move_gohome(wait=True)
+            time.sleep(1.0)
+        else:
+            print("警告：未找到蓝色方块，跳过此步。")
 
+        # ==========================================
+        # 步骤 3: 寻找并抓取【绿色方块】(叠在蓝色上方)
+        # ==========================================
+        print("--- 寻找绿色方块 ---")
+        cv_image = zed.image
+        point_cloud = zed.point_cloud
+        result_green = cube_pose_detector.get_transforms([cv_image, point_cloud], 'green cube')
+        
+        if result_green is not None:
+            t_robot_green, _ = result_green
+            
+            print("抓取绿色方块...")
+            grasp_cube(arm, t_robot_green)
+            time.sleep(0.5)
+            
+            # 目标位置是地基（红块）的 Z 轴加上 2 个方块的高度
+            target_pose_green = base_pose.copy()
+            target_pose_green[2, 3] += 2 * STACK_HEIGHT
+            
+            print("放置绿色方块...")
+            place_cube(arm, target_pose_green)
+            time.sleep(0.5)
+            arm.move_gohome(wait=True)
+            time.sleep(1.0)
+        else:
+            print("警告：未找到绿色方块，跳过此步。")
+
+        print("堆叠任务全部完成！")
+        
     finally:
         # Close Lite6 Robot
         arm.move_gohome(wait=True)
