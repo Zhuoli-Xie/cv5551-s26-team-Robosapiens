@@ -18,7 +18,6 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     """
     image, point_cloud = observation
 
-    
     if len(image.shape) > 2 and image.shape[2] == 4:
         bgr = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
     else:
@@ -46,16 +45,41 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     valid_mask = ~numpy.isnan(cube_points).any(axis=1) & ~numpy.isinf(cube_points).any(axis=1)
     valid_points = cube_points[valid_mask]
 
-    # ZED point cloud is in millimeters, convert to meters for consistency with grasp_cube/place_cube
+    # ZED point cloud is in millimeters, convert to meters
     valid_points = valid_points / 1000.0
 
-    if len(valid_points) < 50:
+    if len(valid_points) < 10:
         return None
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points)
     
-    obb = pcd.get_oriented_bounding_box()
+    # ====== 新增修复逻辑开始 ======
+    
+    # 1. 统计滤波：剔除空气中的离群散点
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=15, std_ratio=2.0)
+    
+    if len(pcd.points) < 10:
+        return None
+
+    # 2. DBSCAN 聚类：分离方块与桌面反光
+    # eps=0.02 表示：点与点之间距离超过 2cm 就认为它们不是同一个物体
+    labels = numpy.array(pcd.cluster_dbscan(eps=0.02, min_points=10))
+    
+    if len(labels) == 0 or labels.max() < 0:
+        print("聚类失败，未找到密集的方块点云")
+        return None
+        
+    # 找出点数最多的一簇（即真正的方块），丢弃其他噪点簇
+    unique_labels, counts = numpy.unique(labels[labels >= 0], return_counts=True)
+    largest_label = unique_labels[numpy.argmax(counts)]
+    cube_indices = numpy.where(labels == largest_label)[0]
+    final_cube_pcd = pcd.select_by_index(cube_indices)
+    
+    # ====== 新增修复逻辑结束 ======
+
+    # 用过滤后干净的点云计算 OBB
+    obb = final_cube_pcd.get_oriented_bounding_box()
     center = obb.center  
     rotation = obb.R     
 
@@ -63,6 +87,8 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     t_cam_cube[:3, :3] = rotation
     t_cam_cube[:3, 3] = center
 
+    # 注意：确保这里你的 camera_pose 传入的是 T_cam_robot (相机在机器人坐标系下的位姿)
+    # 如果 camera_pose 是 T_robot_cam，这里就不需要求逆了。
     T_robot_cam = numpy.linalg.inv(camera_pose)
     t_robot_cube = T_robot_cam @ t_cam_cube
 
