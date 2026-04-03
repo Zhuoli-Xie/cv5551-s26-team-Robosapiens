@@ -180,10 +180,8 @@ def interactive_point_test(cam1: ZedCamera, cam2: ZedCamera, results: dict):
     print("Enter a point in the ROBOT frame and it will be projected onto both camera feeds.")
     print("Type 'q' to quit.\n")
 
-    cv2.namedWindow("CAM1", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("CAM2", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("CAM1", 960, 540)
-    cv2.resizeWindow("CAM2", 960, 540)
+    cv2.namedWindow("CAMERAS", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("CAMERAS", 1280, 540)
 
     while True:
         raw = input("Robot X Y Z (m) > ").strip()
@@ -215,8 +213,17 @@ def interactive_point_test(cam1: ZedCamera, cam2: ZedCamera, results: dict):
         else:
             print("  CAM2: point is behind camera")
 
-        cv2.imshow("CAM1", ann1)
-        cv2.imshow("CAM2", ann2)
+        # Resize to same height (important!)
+        h = 540
+        w1 = int(ann1.shape[1] * h / ann1.shape[0])
+        w2 = int(ann2.shape[1] * h / ann2.shape[0])
+
+        ann1_resized = cv2.resize(ann1, (w1, h))
+        ann2_resized = cv2.resize(ann2, (w2, h))
+
+        combined = np.hstack((ann1_resized, ann2_resized))
+
+        cv2.imshow("CAMERAS", combined)
         cv2.waitKey(1)  # refresh windows without blocking
 
     cv2.destroyAllWindows()
