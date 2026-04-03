@@ -1,0 +1,41 @@
+(rob) rob@rob-00:~/robotics5551$ python FinalProject/record_demo.py
+SDK_VERSION: 1.17.3
+ROBOT_IP: 192.168.1.183, VERSION: v2.7.1, PROTOCOL: V1, DETAIL: 6,9,LI1006,DL1000,v2.7.1, TYPE1300: [0, 0]
+change protocol identifier to 3
+[2026-04-03 16:34:41 UTC][ZED][INFO] Logging level INFO
+[2026-04-03 16:34:43 UTC][ZED][INFO] [Init]  Camera successfully opened.
+[2026-04-03 16:34:43 UTC][ZED][INFO] [Init]  Camera FW version: 1523
+[2026-04-03 16:34:43 UTC][ZED][INFO] [Init]  Video mode: HD2K@15
+[2026-04-03 16:34:43 UTC][ZED][INFO] [Init]  Serial Number: S/N 35916122
+[2026-04-03 16:34:43 UTC][ZED][INFO] [Init]  Depth mode selected: NEURAL. Ensure this mode matches your application's performance and accuracy requirements. See https://www.stereolabs.com/docs/depth-sensing/depth-modes for help.
+
+Record synchronized ZED RGB + point clouds and xArm Lite6 state; merge clouds in a common frame.
+
+Run from this directory:  python record_demo.py --robot-ip <IP>
+
+Keys (OpenCV window):
+  SPACE  Capture current frame(s) + robot state to disk and in-memory merge buffer.
+  m      Merge all buffered captures, voxel-downsample, save merged_session.ply.
+  c      Clear merge buffer (does not delete files on disk).
+  q      Quit.
+
+Dual ZED: pass --zed-serial twice (order matches --T-robot-cam npy files).
+Without calibration .npy files, merge uses identity transforms (all points stay in each camera's
+left optical frame — fill in 4x4 ``T_base_cam`` files when you have hand-eye or extrinsics).
+
+Session directory: /home/rob/robotics5551/demos/session_20260403_163441
+QFontDatabase: Cannot find font directory /home/rob/miniforge3/envs/rob/lib/python3.12/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+QFontDatabase: Cannot find font directory /home/rob/miniforge3/envs/rob/lib/python3.12/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+QFontDatabase: Cannot find font directory /home/rob/miniforge3/envs/rob/lib/python3.12/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+QFontDatabase: Cannot find font directory /home/rob/miniforge3/envs/rob/lib/python3.12/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+QFontDatabase: Cannot find font directory /home/rob/miniforge3/envs/rob/lib/python3.12/site-packages/cv2/qt/fonts.
+Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+Saved capture_0000 (1 in merge buffer)
+Saved capture_0001 (2 in merge buffer)
+Saved capture_0002 (3 in merge buffer)
+Saved capture_0003 (4 in merge buffer)
+Killed
