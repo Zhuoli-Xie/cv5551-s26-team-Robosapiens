@@ -1,24 +1,14 @@
 """
 dual_camera_calibration.py
 
-Calibrates two ZED cameras against the robot base frame using AprilTags
-(same method as checkpoint0), then derives the inter-camera transform.
-
-Coordinate convention
----------------------
-T_cam_robot  :  transforms a point in the ROBOT frame into the CAMERA frame
-                    p_cam = T_cam_robot @ p_robot
-
-T_cam1_cam2  :  transforms a point in CAM2 frame into CAM1 frame
-                    Derived as: T_cam1_robot @ inv(T_cam2_robot)
+Calibrates two ZED cameras against the robot base frame using AprilTags,
+derives the inter-camera transform, and saves results.
 
 Usage
 -----
-    python dual_camera_calibration.py            # calibrate, save, show axes
-    python dual_camera_calibration.py --test     # load saved + verify (no cameras)
-    python dual_camera_calibration.py --both     # calibrate + verify
-    python dual_camera_calibration.py --test --interactive   # verify + point tool
-    python dual_camera_calibration.py --id1 1 --id2 0       # swap USB order
+    python dual_camera_calibration.py           # calibrate + save
+    python dual_camera_calibration.py --load    # load saved + interactive test
+    python dual_camera_calibration.py --id1 1 --id2 0  # swap USB order
 """
 
 import argparse
@@ -33,7 +23,7 @@ from utils.zed_camera import ZedCamera
 from utils.vis_utils import draw_pose_axes
 
 # ---------------------------------------------------------------------------
-# AprilTag / PnP config  (identical to checkpoint0)
+# AprilTag config
 # ---------------------------------------------------------------------------
 
 TAG_SIZE = 0.08  # metres
@@ -47,7 +37,6 @@ TAG_CENTER_COORDINATES = [
 
 
 def get_pnp_pairs(tags):
-    """Return (world_points [N,3], image_points [N,2]) for tag IDs 0-3."""
     world_points = np.empty([0, 3])
     image_points = np.empty([0, 2])
 
@@ -57,10 +46,10 @@ def get_pnp_pairs(tags):
         cx, cy = TAG_CENTER_COORDINATES[tag.tag_id]
         hs = TAG_SIZE / 2
         corners_world = [
-            [cx - hs, cy + hs, 0],  # bottom-left  -> corners[0]
-            [cx - hs, cy - hs, 0],  # bottom-right -> corners[1]
-            [cx + hs, cy - hs, 0],  # top-right    -> corners[2]
-            [cx + hs, cy + hs, 0],  # top-left     -> corners[3]
+            [cx - hs, cy + hs, 0],
+            [cx - hs, cy - hs, 0],
+            [cx + hs, cy - hs, 0],
+            [cx + hs, cy + hs, 0],
         ]
         for wp, ip in zip(corners_world, tag.corners):
             world_points = np.vstack([world_points, wp])
@@ -70,7 +59,6 @@ def get_pnp_pairs(tags):
 
 
 def get_transform_camera_robot(observation, camera_intrinsic, label="camera"):
-    """Estimate T_cam_robot (4x4) from AprilTag detections. Returns None on failure."""
     detector = Detector(families='tag36h11')
 
     gray = observation
@@ -110,11 +98,10 @@ def get_transform_camera_robot(observation, camera_intrinsic, label="camera"):
 
 
 # ---------------------------------------------------------------------------
-# Core calibration routine
+# Calibration
 # ---------------------------------------------------------------------------
 
 def calibrate_two_cameras(cam1: ZedCamera, cam2: ZedCamera):
-    """Capture frames from both cameras and compute all three transforms."""
     print("\n=== Capturing frames ===")
     img1 = cam1.image
     img2 = cam2.image
@@ -128,12 +115,10 @@ def calibrate_two_cameras(cam1: ZedCamera, cam2: ZedCamera):
     if T1 is None or T2 is None:
         return None
 
-    T_cam1_cam2 = T1 @ np.linalg.inv(T2)  # cam2 -> robot -> cam1
-
     return {
         "T_cam1_robot": T1,
         "T_cam2_robot": T2,
-        "T_cam1_cam2":  T_cam1_cam2,
+        "T_cam1_cam2":  T1 @ np.linalg.inv(T2),
     }
 
 
@@ -146,7 +131,7 @@ SAVE_PATH = Path("calibration_results.npz")
 
 def save_calibration(results: dict, path: Path = SAVE_PATH):
     np.savez(path, **results)
-    print(f"\nCalibration saved -> {path.resolve()}")
+    print(f"Calibration saved -> {path.resolve()}")
 
 
 def load_calibration(path: Path = SAVE_PATH) -> dict:
@@ -157,145 +142,83 @@ def load_calibration(path: Path = SAVE_PATH) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Verification
+# Interactive point tester
 # ---------------------------------------------------------------------------
 
-def _fmt_matrix(label, M):
-    print(f"\n{label}")
-    print(np.array2string(M, formatter={"float_kind": lambda x: f"{x:10.5f}"}))
+def project_point_onto_image(image, point_robot, T_cam_robot, camera_intrinsic):
+    """
+    Draw a crosshair on a copy of image at the pixel corresponding to
+    point_robot (homogeneous 4-vec in robot frame).
+    Returns the annotated image and the projected (u, v) pixel.
+    """
+    p_cam = T_cam_robot @ point_robot          # robot -> camera
+    x, y, z = p_cam[:3]
+
+    if z <= 0:
+        return image.copy(), None              # point is behind camera
+
+    K = camera_intrinsic
+    u = int(K[0, 0] * x / z + K[0, 2])
+    v = int(K[1, 1] * y / z + K[1, 2])
+
+    out = image.copy()
+    r = 20
+    cv2.line(out, (u - r, v), (u + r, v), (0, 255, 0), 2)
+    cv2.line(out, (u, v - r), (u, v + r), (0, 255, 0), 2)
+    cv2.circle(out, (u, v), r, (0, 255, 0), 2)
+    cv2.putText(out, f"({x:.3f}, {y:.3f}, {z:.3f})",
+                (u + 25, v - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    return out, (u, v)
 
 
-def verify_transforms(results: dict):
-    T1  = results["T_cam1_robot"]
-    T2  = results["T_cam2_robot"]
-    T12 = results["T_cam1_cam2"]
+def interactive_point_test(cam1: ZedCamera, cam2: ZedCamera, results: dict):
+    T1 = results["T_cam1_robot"]
+    T2 = results["T_cam2_robot"]
 
-    print("\n" + "="*60)
-    print("CALIBRATION VERIFICATION REPORT")
-    print("="*60)
-
-    _fmt_matrix("T_cam1_robot  (robot -> cam1)", T1)
-    _fmt_matrix("T_cam2_robot  (robot -> cam2)", T2)
-    _fmt_matrix("T_cam1_cam2   (cam2  -> cam1)", T12)
-
-    # Rotation matrix validity
-    print("\n-- Rotation matrix checks --")
-    for label, T in [("cam1_robot", T1), ("cam2_robot", T2), ("cam1_cam2", T12)]:
-        R = T[:3, :3]
-        det = np.linalg.det(R)
-        orth_err = np.max(np.abs(R @ R.T - np.eye(3)))
-        ok = abs(det - 1) < 1e-4 and orth_err < 1e-4
-        print(f"  {label:15s}  det(R)={det:.6f}  orth_err={orth_err:.2e}  [{'OK' if ok else 'FAIL'}]")
-
-    # T12 consistency
-    T12_check = T1 @ np.linalg.inv(T2)
-    err = np.max(np.abs(T12 - T12_check))
-    print(f"\n-- T_cam1_cam2 consistency: max_err={err:.2e}  [{'OK' if err < 1e-8 else 'FAIL'}]")
-
-    # Translation magnitudes
-    print("\n-- Translation magnitudes --")
-    print(f"  |t_cam1_robot| = {np.linalg.norm(T1[:3,3]):.3f} m")
-    print(f"  |t_cam2_robot| = {np.linalg.norm(T2[:3,3]):.3f} m")
-    print(f"  |t_cam1_cam2|  = {np.linalg.norm(T12[:3,3]):.3f} m  (inter-camera baseline)")
-
-    # Synthetic point round-trip through known tag positions
-    print("\n-- Synthetic point round-trip --")
-    test_points = np.array([
-        [0.38,  0.4,  0.0, 1.0],
-        [0.38, -0.4,  0.0, 1.0],
-        [0.0,   0.4,  0.0, 1.0],
-        [0.0,  -0.4,  0.0, 1.0],
-        [0.19,  0.0,  0.1, 1.0],
-    ])
-    print(f"  {'Robot point (m)':35s}  {'cam1 direct vs cam2->cam1':>28s}")
-    all_ok = True
-    for p in test_points:
-        p_cam1_direct = T1  @ p
-        p_cam1_via2   = T12 @ (T2 @ p)
-        diff_mm = np.linalg.norm(p_cam1_direct[:3] - p_cam1_via2[:3]) * 1000
-        ok = diff_mm < 0.1
-        if not ok:
-            all_ok = False
-        coord = f"({p[0]:.2f}, {p[1]:.2f}, {p[2]:.2f})"
-        print(f"  {coord:35s}  {diff_mm:8.4f} mm  [{'OK' if ok else 'WARN'}]")
-
-    print("\n" + "="*60)
-    print(f"Verification complete -- {'ALL OK' if all_ok else 'CHECK WARNINGS ABOVE'}")
-    print("="*60)
-
-
-def interactive_point_test(results: dict):
-    """Type a point in any frame, see it transformed into all others."""
-    T1      = results["T_cam1_robot"]
-    T2      = results["T_cam2_robot"]
-    T12     = results["T_cam1_cam2"]
-    T1_inv  = np.linalg.inv(T1)
-    T2_inv  = np.linalg.inv(T2)
-    T12_inv = np.linalg.inv(T12)
-
-    print("\n=== Interactive Point Transformer ===")
-    print("Enter:  <frame> <X> <Y> <Z>  (metres)")
-    print("Frames: robot | cam1 | cam2")
+    print("\n=== Interactive Point Tester ===")
+    print("Enter a point in the ROBOT frame and it will be projected onto both camera feeds.")
     print("Type 'q' to quit.\n")
 
+    cv2.namedWindow("CAM1", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("CAM2", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("CAM1", 960, 540)
+    cv2.resizeWindow("CAM2", 960, 540)
+
     while True:
-        raw = input("> ").strip()
+        raw = input("Robot X Y Z (m) > ").strip()
         if raw.lower() == 'q':
             break
         parts = raw.split()
-        if len(parts) != 4 or parts[0] not in ("robot", "cam1", "cam2"):
-            print("  Usage:  robot 0.38 0.4 0.0")
+        if len(parts) != 3:
+            print("  Usage:  0.38 0.4 0.0")
             continue
         try:
-            xyz = np.array([float(x) for x in parts[1:]] + [1.0])
+            xyz = np.array([float(p) for p in parts] + [1.0])
         except ValueError:
             print("  Invalid numbers.")
             continue
 
-        frame = parts[0]
-        if frame == "robot":
-            p_robot = xyz
-            p_cam1  = T1     @ p_robot
-            p_cam2  = T2     @ p_robot
-        elif frame == "cam1":
-            p_cam1  = xyz
-            p_robot = T1_inv  @ p_cam1
-            p_cam2  = T12_inv @ p_cam1
+        img1 = cam1.image
+        img2 = cam2.image
+
+        ann1, px1 = project_point_onto_image(img1, xyz, T1, cam1.camera_intrinsic)
+        ann2, px2 = project_point_onto_image(img2, xyz, T2, cam2.camera_intrinsic)
+
+        if px1:
+            print(f"  CAM1 pixel: {px1}")
         else:
-            p_cam2  = xyz
-            p_robot = T2_inv @ p_cam2
-            p_cam1  = T12    @ p_cam2
+            print("  CAM1: point is behind camera")
 
-        def fmt(v):
-            return f"({v[0]:.4f}, {v[1]:.4f}, {v[2]:.4f}) m"
+        if px2:
+            print(f"  CAM2 pixel: {px2}")
+        else:
+            print("  CAM2: point is behind camera")
 
-        print(f"  robot : {fmt(p_robot)}")
-        print(f"  cam1  : {fmt(p_cam1)}")
-        print(f"  cam2  : {fmt(p_cam2)}\n")
+        cv2.imshow("CAM1", ann1)
+        cv2.imshow("CAM2", ann2)
+        cv2.waitKey(1)  # refresh windows without blocking
 
-
-# ---------------------------------------------------------------------------
-# Visualization
-# ---------------------------------------------------------------------------
-
-def visualize_calibration(cam1: ZedCamera, cam2: ZedCamera, results: dict):
-    """Draw robot-frame axes on each camera's live image to visually confirm calibration."""
-    T1 = results["T_cam1_robot"]
-    T2 = results["T_cam2_robot"]
-
-    img1 = cam1.image.copy()
-    img2 = cam2.image.copy()
-
-    draw_pose_axes(img1, cam1.camera_intrinsic, T1, size=TAG_SIZE)
-    draw_pose_axes(img2, cam2.camera_intrinsic, T2, size=TAG_SIZE)
-
-    for name, img in [("CAM1 -- robot origin", img1), ("CAM2 -- robot origin", img2)]:
-        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(name, 960, 540)
-        cv2.imshow(name, img)
-
-    print("\nVisualization open -- press any key to close.")
-    cv2.waitKey(0)
     cv2.destroyAllWindows()
 
 
@@ -305,20 +228,10 @@ def visualize_calibration(cam1: ZedCamera, cam2: ZedCamera, results: dict):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Dual ZED camera calibration via AprilTags")
-    p.add_argument("--test",        action="store_true",
-                   help="Load saved calibration and verify (no cameras needed)")
-    p.add_argument("--both",        action="store_true",
-                   help="Calibrate, save, then verify")
-    p.add_argument("--vis",         action="store_true",
-                   help="Show axis visualisation after calibration (default: on)")
-    p.add_argument("--no-vis",      action="store_true",
-                   help="Skip visualisation")
-    p.add_argument("--interactive", action="store_true",
-                   help="Launch interactive point transformer")
-    p.add_argument("--id1",  type=int, default=0,
-                   help="USB device index for cam1 (default: 0)")
-    p.add_argument("--id2",  type=int, default=1,
-                   help="USB device index for cam2 (default: 1)")
+    p.add_argument("--load", action="store_true",
+                   help="Skip calibration, load saved results and go straight to interactive test")
+    p.add_argument("--id1",  type=int, default=0, help="USB index for cam1 (default: 0)")
+    p.add_argument("--id2",  type=int, default=1, help="USB index for cam2 (default: 1)")
     p.add_argument("--save", type=str, default=str(SAVE_PATH),
                    help=f"Path to save/load calibration (default: {SAVE_PATH})")
     return p.parse_args()
@@ -328,34 +241,21 @@ def main():
     args = parse_args()
     save_path = Path(args.save)
 
-    if args.test:
-        results = load_calibration(save_path)
-        verify_transforms(results)
-        if args.interactive:
-            interactive_point_test(results)
-        return
-
     print(f"Initializing cam1 (id={args.id1}) and cam2 (id={args.id2})...")
     cam1 = ZedCamera(camera_id=args.id1)
     cam2 = ZedCamera(camera_id=args.id2)
 
     try:
-        results = calibrate_two_cameras(cam1, cam2)
-        if results is None:
-            print("\nCalibration failed. Make sure the arena poster is visible to both cameras.")
-            sys.exit(1)
+        if args.load:
+            results = load_calibration(save_path)
+        else:
+            results = calibrate_two_cameras(cam1, cam2)
+            if results is None:
+                print("\nCalibration failed. Make sure the arena poster is visible to both cameras.")
+                sys.exit(1)
+            save_calibration(results, save_path)
 
-        save_calibration(results, save_path)
-
-        show_vis = not args.no_vis  # show by default unless --no-vis
-        if show_vis:
-            visualize_calibration(cam1, cam2, results)
-
-        if args.both:
-            verify_transforms(results)
-
-        if args.interactive:
-            interactive_point_test(results)
+        interactive_point_test(cam1, cam2, results)
 
     finally:
         cam1.close()
