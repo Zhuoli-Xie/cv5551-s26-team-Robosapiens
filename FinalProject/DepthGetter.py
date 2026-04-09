@@ -7,7 +7,7 @@ init_params = sl.InitParameters()
 init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE  # more stable
 init_params.coordinate_units = sl.UNIT.METER
 init_params.depth_minimum_distance = 0.3
-init_params.depth_maximum_distance = 5.0
+init_params.depth_maximum_distance = 10.0
 
 status = zed.open(init_params)
 if status != sl.ERROR_CODE.SUCCESS:
