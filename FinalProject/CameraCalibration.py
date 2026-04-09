@@ -328,7 +328,16 @@ def create_camera_parameters_from_calibration(calib_path: Path = SAVE_PATH):
     """
     results = load_calibration(calib_path)
     
-    from your_d3_fields_file import CameraParameters  # Import from your D^3 Fields file
+    # Create camera parameter objects matching your D^3 Fields structure
+    class CameraParameters:
+        def __init__(self, name, image_path, depth_path, intrinsics, extrinsics):
+            self.name = name
+            self.image_path = image_path      # RGB image
+            self.depth_path = depth_path      # Depth map
+            self.intrinsics = intrinsics      # 3x3 camera matrix
+            self.extrinsics = extrinsics      # 4x4 world to camera transform
+            self.width = None
+            self.height = None
     
     cam1 = CameraParameters(
         name="cam1",
