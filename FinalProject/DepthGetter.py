@@ -34,3 +34,16 @@ if zed.grab(runtime_params) == sl.ERROR_CODE.SUCCESS:
 
 # Close camera
 zed.close()
+
+
+import numpy as np
+
+depth_map = np.load("cam1.npy")
+print(depth_map.shape, depth_map.dtype)
+
+import matplotlib.pyplot as plt
+
+plt.imshow(depth_map, cmap="plasma")  # or "viridis", "inferno"
+plt.colorbar(label="Depth")
+plt.title("Depth Map")
+plt.show()
