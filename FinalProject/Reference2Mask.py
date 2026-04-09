@@ -1,122 +1,375 @@
-Sure. Let me walk through this from the top down.
+import torch
+import cv2
+import numpy as np
+from PIL import Image
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+from segment_anything import sam_model_registry, SamPredictor
+import os
+import json
 
----
+# ============================================
+# CAMERA PARAMETERS (ZED2i - Load from your calibration)
+# ============================================
+class CameraParameters:
+    def __init__(self, name, image_path, depth_path, intrinsics, extrinsics):
+        self.name = name
+        self.image_path = image_path      # RGB image (cam1.png, cam2.png)
+        self.depth_path = depth_path      # Depth map from ZED2i
+        self.intrinsics = intrinsics      # 3x3 camera matrix
+        self.extrinsics = extrinsics      # 4x4 world to camera transform
+        self.width = None
+        self.height = None
 
-## The Big Picture: What Problem Is This Solving?
+def load_camera_calibration():
+    """
+    Load actual ZED2i calibration data
+    Replace paths with your actual calibration files
+    """
+    with open('zed2i_calibration.json', 'r') as f:
+        calib = json.load(f)
+    
+    intrinsics_cam1 = np.array(calib['cam1']['intrinsics'])
+    extrinsics_cam1 = np.array(calib['cam1']['extrinsics'])  # World to cam1
+    
+    intrinsics_cam2 = np.array(calib['cam2']['intrinsics'])
+    extrinsics_cam2 = np.array(calib['cam2']['extrinsics'])  # World to cam2
+    
+    cam1 = CameraParameters(
+        name="cam1",
+        image_path="cam1.png",
+        depth_path="cam1_depth.npy",
+        intrinsics=intrinsics_cam1,
+        extrinsics=extrinsics_cam1
+    )
+    
+    cam2 = CameraParameters(
+        name="cam2",
+        image_path="cam2.png",
+        depth_path="cam2_depth.npy",
+        intrinsics=intrinsics_cam2,
+        extrinsics=extrinsics_cam2
+    )
+    
+    return [cam1, cam2]
 
-Imagine you want a robot arm to rearrange objects on a table — say, organize shoes to match a photo you took on your phone. The robot needs to answer two questions continuously: *where are the objects right now in 3D space*, and *how does that compare to where they should be according to the goal photo*.
+# ============================================
+# 1. LOAD MODELS
+# ============================================
+print("="*50)
+print("LOADING MODELS")
+print("="*50)
 
-The naive approach would be to just look at the camera feed as a flat 2D image. But 2D is lossy — you lose depth, you can't reason about occlusions properly, and matching a workspace camera image to a totally different goal photo (different lighting, different shoes, a sketch drawing, an AI-generated image) is very hard when you're working pixel-by-pixel.
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
 
-D3Fields solves this by building a **living, queryable 3D representation of the scene** that encodes not just geometry but *meaning*. You can ask it "what does the space at coordinate (x, y, z) look like semantically?" and it will give you a rich descriptor that you can compare against features extracted from your goal image — even if the goal image looks completely different stylistically.
+# Grounding DINO
+model_id = "IDEA-Research/grounding-dino-tiny"
+processor = AutoProcessor.from_pretrained(model_id)
+grounding_dino = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
+grounding_dino.eval().to(device)
 
----
+# DINOv2
+print("Loading DINOv2 ViT-S/14...")
+dinov2 = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+dinov2.eval().to(device)
 
-## The Architecture in Three Layers
+# SAM
+sam_checkpoint = "sam_vit_b_01ec64.pth"
+sam = sam_model_registry["vit_b"](checkpoint=sam_checkpoint)
+sam = sam.to(device)
+sam_predictor = SamPredictor(sam)
 
-The system has three major components that chain together:
+print("All models loaded\n")
 
-**W (the feature volumes)** → **F(x|W) (the implicit field)** → **Planning cost**
+# ============================================
+# 2. BUILD W: PER-CAMERA FEATURE VOLUMES
+# ============================================
+class D3Fields:
+    """
+    D^3 Fields: Dynamic 3D Descriptor Fields
+    Implements F(x | W) from the paper
+    W = { (R_i, W^f_i, W^p_i) } for each camera i
+    """
+    
+    def __init__(self, cameras, truncation_mu=0.1):
+        self.cameras = cameras
+        self.mu = truncation_mu  # Truncation threshold for TSDF (meters)
+        self.delta = 1e-6
+        
+        # Store per-camera volumes
+        self.depth_maps = []           # R_i: Depth maps from ZED2i
+        self.semantic_features = []    # W^f_i: DINOv2 features
+        self.instance_masks = []       # W^p_i: Instance masks from Grounded-SAM
+        
+        self._build_feature_volumes()
+    
+    def _build_feature_volumes(self):
+        """Build W for all cameras"""
+        
+        for cam in self.cameras:
+            print(f"\nProcessing {cam.name}...")
+            
+            # Load RGB image
+            image_pil = Image.open(cam.image_path)
+            if image_pil.mode != 'RGB':
+                image_pil = image_pil.convert('RGB')
+            
+            cam.width, cam.height = image_pil.size
+            
+            # Convert to numpy for SAM
+            image_np = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
+            
+            # ============================================
+            # R_i: Load depth map from ZED2i (already exists)
+            # ============================================
+            depth_map = np.load(cam.depth_path)
+            self.depth_maps.append(depth_map)
+            print(f"   Depth map R_i loaded: {depth_map.shape}")
+            
+            # ============================================
+            # W^f_i: DINOv2 dense patch feature map
+            # FIX 1: Use forward_features + patch tokens instead of
+            # forward(), which returns only the [CLS] token vector.
+            # The paper requires W^f_i in R^{H x W x N} (spatial map).
+            # ============================================
+            semantic_features = self._extract_dinov2_features(image_pil)
+            self.semantic_features.append(semantic_features)
+            print(f"   Semantic features W^f_i: {semantic_features.shape}")
+            
+            # ============================================
+            # W^p_i: Instance masks from Grounded-SAM
+            # ============================================
+            instance_masks = self._extract_instance_masks(image_pil, image_np)
+            self.instance_masks.append(instance_masks)
+            print(f"   Instance masks W^p_i: {instance_masks.shape}")
+    
+    def _extract_dinov2_features(self, image_pil):
+        """
+        Extract DINOv2 dense spatial feature map W^f_i.
+        Returns: (H, W, 384) feature volume.
 
-Think of W as the raw ingredients, F as the recipe that combines them on demand, and the planning cost as the judgment of whether the dish matches the goal.
+        FIX 1: dinov2(img) returns the [CLS] token — a single (1, 384) vector,
+        not a spatial map. We use forward_features() and take x_norm_patchtokens
+        to get one embedding per patch, then reshape to (patch_h, patch_w, 384)
+        and resize to the full image resolution.
+        """
+        from torchvision import transforms
+        
+        # ViT-S/14 with 224px input → 16x16 = 256 patches
+        input_size = 224
+        patch_size = 14
+        patch_grid = input_size // patch_size  # 16
 
----
+        transform = transforms.Compose([
+            transforms.Resize((input_size, input_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        img_tensor = transform(image_pil).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            out = dinov2.forward_features(img_tensor)
+            # x_norm_patchtokens: (1, num_patches, 384) — spatial patch embeddings
+            features = out["x_norm_patchtokens"]  # (1, 256, 384)
+        
+        features = features.squeeze(0).cpu().numpy()          # (256, 384)
+        features = features.reshape(patch_grid, patch_grid, -1)  # (16, 16, 384)
+        
+        # Resize back to original image resolution
+        h, w = image_pil.size[1], image_pil.size[0]
+        features_resized = cv2.resize(features, (w, h), interpolation=cv2.INTER_LINEAR)
+        # cv2.resize drops the channel dim when C==1, but 384 > 1 so shape stays (H, W, 384)
+        
+        return features_resized  # (H, W, 384)
+    
+    def _extract_instance_masks(self, image_pil, image_np):
+        """
+        Extract instance masks W^p_i using Grounded-SAM.
+        Returns: (H, W, M) where M = number of instances + 1 (background)
+        """
+        text = "object. phone. remote. cup. book. shoe. pen. mug. fork. spoon."
+        inputs = processor(images=image_pil, text=text, return_tensors="pt").to(device)
+        
+        with torch.no_grad():
+            outputs = grounding_dino(**inputs)
+        
+        results = processor.post_process_grounded_object_detection(
+            outputs=outputs,
+            input_ids=inputs.input_ids,
+            threshold=0.4,
+            text_threshold=0.3,
+            target_sizes=[(image_pil.size[1], image_pil.size[0])],
+            text_labels=True
+        )
+        
+        sam_predictor.set_image(image_np)
+        
+        M = len(results[0]["boxes"]) + 1  # +1 for background
+        instance_volume = np.zeros((image_pil.size[1], image_pil.size[0], M), dtype=np.float32)
+        instance_volume[:, :, 0] = 1.0   # background channel
+        
+        for idx, (box, label, score) in enumerate(zip(
+            results[0]["boxes"], results[0]["labels"], results[0]["scores"]
+        )):
+            box_np = box.cpu().numpy()
+            masks, mask_scores, _ = sam_predictor.predict(
+                box=box_np,
+                multimask_output=False
+            )
+            mask = masks[0]
+            instance_volume[mask, idx + 1] = 1.0
+            instance_volume[mask, 0] = 0.0   # remove from background
+            print(f"      Instance {idx+1}: {label} (score: {score:.3f})")
+        
+        return instance_volume  # (H, W, M)
+    
+    # ============================================
+    # 3. F(x | W): Query arbitrary 3D points
+    # ============================================
+    def query(self, x_world):
+        """
+        Implements F(x | W) from Equations 2-6.
 
-## Layer 1: Building W — The Per-Camera Feature Volumes
+        Args:
+            x_world: (N, 3) array or tensor of 3D points in world coordinates.
 
-This happens in `_build_feature_volumes()` and the two extraction helpers. For each camera you have, the code builds three data structures and stores them together as W:
+        Returns:
+            d: (N,)      signed distances (Eq. 6, numerator uses v_i * d'_i)
+            f: (N, 384)  semantic descriptors (Eq. 6, numerator uses v_i * w_i * f_i)
+            p: (N, M)    instance probabilities (Eq. 6, numerator uses v_i * w_i * p_i)
+        """
+        N = x_world.shape[0]
+        
+        if not isinstance(x_world, torch.Tensor):
+            x_world = torch.tensor(x_world, dtype=torch.float32, device=device)
+        else:
+            x_world = x_world.to(device)
+        
+        M = self.instance_masks[0].shape[-1]
+        
+        d_total      = torch.zeros(N,       device=device)
+        f_total      = torch.zeros(N, 384,  device=device)
+        p_total      = torch.zeros(N, M,    device=device)
+        # FIX 3: d is weighted by Σ v_i; f and p are weighted by Σ v_i * w_i
+        v_total      = torch.zeros(N,       device=device)   # denominator for d
+        vw_total     = torch.zeros(N,       device=device)   # denominator for f, p
+        
+        for cam_idx, cam in enumerate(self.cameras):
+            # FIX 4: convert extrinsics to tensor on the correct device inside helper
+            points_cam = self._world_to_camera(x_world, cam.extrinsics)
+            u, v_coord, depths = self._camera_to_image(points_cam, cam.intrinsics)
+            
+            valid = (u >= 0) & (u < cam.width) & (v_coord >= 0) & (v_coord < cam.height) & (depths > 0)
+            
+            if not valid.any():
+                continue
+            
+            u_valid = u[valid].long()
+            v_valid = v_coord[valid].long()
+            
+            # Depth reading r'_i from depth map (Eq. 3)
+            depth_map = torch.tensor(self.depth_maps[cam_idx], dtype=torch.float32, device=device)
+            r_prime = depth_map[v_valid, u_valid]
+            
+            # Truncated signed distance d_i and d'_i (Eq. 3)
+            d_i       = depths[valid] - r_prime
+            d_i_trunc = torch.clamp(d_i, -self.mu, self.mu)
+            
+            # Visibility v_i and weight w_i (Eq. 4)
+            v_i = (d_i < self.mu).float()
 
-### The Depth Map R_i
+            # FIX 2: clamp with max=0, not min=0.
+            # When |d_i| > mu the exponent must be negative (decaying weight).
+            # Original code used clamp(min=0) which forced w_i = exp(0) = 1 always.
+            w_i = torch.exp(torch.clamp(self.mu - torch.abs(d_i), max=0.0) / self.mu)
+            
+            # Semantic features f_i and instance mask p_i (Eq. 5)
+            semantic_volume  = torch.tensor(self.semantic_features[cam_idx],
+                                            dtype=torch.float32, device=device)
+            instance_volume  = torch.tensor(self.instance_masks[cam_idx],
+                                            dtype=torch.float32, device=device)
+            f_i = semantic_volume[v_valid, u_valid, :]   # (N_valid, 384)
+            p_i = instance_volume[v_valid, u_valid, :]   # (N_valid, M)
+            
+            # Accumulate (Eq. 6)
+            d_total[valid]  += v_i * d_i_trunc
+            f_total[valid]  += (v_i * w_i).unsqueeze(-1) * f_i
+            p_total[valid]  += (v_i * w_i).unsqueeze(-1) * p_i
+            v_total[valid]  += v_i
+            vw_total[valid] += v_i * w_i
+        
+        # Normalize (Eq. 6): d uses Σv_i, f and p use Σ(v_i * w_i)
+        has_v  = v_total  > 0
+        has_vw = vw_total > 0
 
-This is the simplest piece. Your ZED2i stereo camera already gives you a depth image — for every pixel (u, v), it tells you how far away the surface is in meters. This gets loaded directly from your `.npy` file. It answers the question: *at this pixel, how far away is the nearest surface?*
+        d_total[has_v]  = d_total[has_v]  / (self.delta + v_total[has_v])
+        f_total[has_vw] = f_total[has_vw] / (self.delta + vw_total[has_vw].unsqueeze(-1))
+        p_total[has_vw] = p_total[has_vw] / (self.delta + vw_total[has_vw].unsqueeze(-1))
+        
+        return d_total, f_total, p_total
+    
+    def _world_to_camera(self, points_world, extrinsics):
+        """
+        Transform points from world to camera coordinates.
 
-### The Semantic Feature Volume W^f_i
+        FIX 4: Convert the numpy extrinsics array to a float32 tensor on the
+        same device as points_world before doing any arithmetic. The original
+        code left extrinsics as numpy, causing a device/type mismatch at runtime.
+        """
+        ext = torch.tensor(extrinsics, dtype=torch.float32, device=points_world.device)
+        R   = ext[:3, :3]
+        t   = ext[:3, 3]
+        return points_world @ R.T + t.unsqueeze(0)
+    
+    def _camera_to_image(self, points_cam, intrinsics):
+        """Project camera-space points to image pixel coordinates."""
+        intr = torch.tensor(intrinsics, dtype=torch.float32, device=points_cam.device)
+        fx, fy = intr[0, 0], intr[1, 1]
+        cx, cy = intr[0, 2], intr[1, 2]
+        
+        depths = points_cam[:, 2]
+        u = (points_cam[:, 0] * fx / depths) + cx
+        v = (points_cam[:, 1] * fy / depths) + cy
+        
+        return u, v, depths
 
-This is where DINOv2 comes in. DINOv2 is a vision transformer trained on enormous amounts of image data with self-supervision — it learned to produce feature vectors that encode *what something is* in a way that generalizes across appearances. A sneaker from a catalog photo and a sneaker on your robot's workspace table will produce similar DINOv2 features, even though the pixels look nothing alike. This is the magic that enables zero-shot generalization.
 
-The key fix here was using `forward_features()["x_norm_patchtokens"]` instead of a plain forward pass. A vision transformer chops the image into a grid of patches (14×14 pixels each for ViT-S/14), runs attention across all of them, and produces one embedding vector per patch. There's also a special `[CLS]` token that summarizes the whole image. The plain `dinov2(img)` call returns only that global summary vector — one number per dimension for the whole image, useless for spatial reasoning. What you need is the per-patch embeddings: a 16×16 grid of vectors (for a 224px input), each describing a local region of the image. The code reshapes these into `(16, 16, 384)` and then upsamples back to the full image resolution `(H, W, 384)`. Now every pixel has a 384-dimensional semantic fingerprint.
+# ============================================
+# 4. USAGE EXAMPLE
+# ============================================
+if __name__ == "__main__":
+    cameras = load_camera_calibration()
+    
+    d3_fields = D3Fields(cameras, truncation_mu=0.1)
+    
+    x_world = torch.tensor([
+        [0.0,  0.0,  1.0],
+        [0.1,  0.1,  0.9],
+        [-0.1, 0.05, 1.1],
+    ], device=device)
+    
+    distances, semantic_features, instance_probs = d3_fields.query(x_world)
+    
+    print("\n" + "="*50)
+    print("QUERY RESULTS")
+    print("="*50)
+    print(f"Signed distances:           {distances}")
+    print(f"Semantic features shape:    {semantic_features.shape}")
+    print(f"Instance probabilities shape: {instance_probs.shape}")
 
-### The Instance Mask Volume W^p_i
 
-This answers the question: *which object does this pixel belong to?* It's built using a two-stage pipeline:
+'''
+Example Calibration File needed
+{
+  "cam1": {
+    "intrinsics": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+    "extrinsics": [[r11, r12, r13, tx], [r21, r22, r23, ty], [r31, r32, r33, tz], [0, 0, 0, 1]]
+  },
+  "cam2": { ... }
+}
 
-First, Grounding DINO runs open-vocabulary object detection. You give it a text prompt listing possible object categories and it returns bounding boxes with confidence scores. It's "open vocabulary" meaning it wasn't trained on a fixed set of classes — it can find objects it's described in natural language.
+need to get depth maps from both images
 
-Second, those bounding boxes are handed to SAM (Segment Anything Model), which refines them into precise pixel-level masks. SAM is extremely good at finding exact object boundaries given a rough region hint.
 
-The result is stored as a `(H, W, M)` volume where M is the number of detected instances plus one background channel. Each pixel gets a one-hot encoding — a 1 in the channel corresponding to whichever object it belongs to, 0 everywhere else. This is what lets the system later distinguish "I'm looking at instance 2, not instance 1" when there are multiple objects.
-
----
-
-## Layer 2: F(x|W) — The Implicit Field Query
-
-This is the core intellectual contribution of the paper, implemented in `query()`. The word "implicit" here is important — there's no explicit 3D voxel grid being stored. Instead, the field is a *function* you evaluate on demand at any 3D point you care about. This is much more memory-efficient and lets you query at arbitrary resolution.
-
-When you call `d3_fields.query(x_world)` with a batch of N 3D points, here's what happens for each camera:
-
-### Step 1: Project the 3D Point into Camera Space
-
-`_world_to_camera()` applies the camera's extrinsic matrix — a 4×4 rigid transform that encodes where the camera is positioned and oriented in the world. This converts your world-frame coordinates into coordinates relative to that camera's viewpoint.
-
-`_camera_to_image()` then applies the intrinsic matrix — the focal lengths and principal point that encode how that camera maps 3D rays to 2D pixels. This gives you the pixel coordinates (u, v) where your 3D point would appear in that camera's image, plus the depth (how far along the camera's Z axis the point sits).
-
-### Step 2: Compute How Close the Point Is to a Real Surface (Eq. 3)
-
-You now have two depths for this 3D point in this camera's view:
-- `r_i`: the actual 3D distance from the camera to your query point
-- `r'_i`: what the depth map says the surface distance is at that pixel
-
-The difference `d_i = r_i - r'_i` tells you where your query point sits relative to the real surface:
-- If `d_i` is near zero, your point is right on the surface
-- If `d_i` is large and positive, your point is behind the surface (occluded)
-- If `d_i` is negative, your point is in free space in front of the surface
-
-This is a Truncated Signed Distance Function (TSDF), a standard technique in 3D reconstruction. It gets clamped to `[-μ, μ]` so distant points don't dominate the fusion.
-
-### Step 3: Compute Two Weights Per Camera (Eq. 4)
-
-**v_i (visibility):** A hard binary gate. If `d_i >= μ`, the point is behind the surface from this camera's perspective — the camera literally can't see it there, so it contributes nothing (`v_i = 0`). Otherwise `v_i = 1`.
-
-**w_i (confidence/proximity weight):** A soft exponential weight. Even when a point is visible, we're most confident about its features when it's right on the surface (where the depth reading is most reliable). As the point moves away from the surface in either direction, `w_i` decays toward zero. This is the fix from earlier — the exponent `min(μ - |d_i|, 0) / μ` is always ≤ 0, so `exp(...)` is always ≤ 1, decaying as |d_i| grows.
-
-The reason for two separate weights: visibility is a prerequisite (you either see it or you don't), while confidence is a continuous quality score for views that do see it.
-
-### Step 4: Look Up Features at the Projected Pixel (Eq. 5)
-
-With pixel coordinates (u, v) in hand, the code simply indexes into the two feature volumes built earlier:
-- `f_i = W^f_i[v, u]` — the 384-dim DINOv2 feature at that pixel
-- `p_i = W^p_i[v, u]` — the M-dim one-hot instance mask at that pixel
-
-These are the features "seen" at this 3D location from camera i's perspective.
-
-### Step 5: Fuse Across All Cameras (Eq. 6)
-
-Now you have contributions from potentially multiple cameras. They get combined as weighted averages:
-
-- **d** (signed distance): weighted average of `d'_i` using `v_i` weights. This fuses the geometry from all cameras that can see the point.
-- **f** (semantic features): weighted average of `f_i` using `v_i * w_i` weights. Cameras that see the point from a closer, cleaner angle contribute more.
-- **p** (instance probability): weighted average of `p_i` using `v_i * w_i` weights. Same logic.
-
-Crucially — and this is Fix 3 — `d` uses `Σ v_i` as its denominator while `f` and `p` use `Σ (v_i * w_i)`. The geometry fusion only cares about visibility (was this point seen?). The feature fusion additionally weights by proximity confidence (how reliably was it seen?).
-
-The `delta` in the denominator is just a tiny number (1e-6) to prevent division by zero when no camera sees a point.
-
----
-
-## Layer 3: What the Output Is Used For
-
-The three outputs serve distinct roles in the downstream planning system:
-
-**d (signed distance):** Used to reconstruct the object's 3D mesh via marching cubes — an algorithm that finds the zero-crossing surface of the distance field. This gives you a 3D model of where the object actually is.
-
-**f (semantic features):** Used to establish correspondences between the 3D workspace and the 2D goal image. You extract DINOv2 features from the goal image too, then find which 3D points in the workspace have features closest to the goal image features. This is how "banana in the workspace" gets matched to "banana drawn as a sketch in the goal image" — they share similar DINOv2 features despite looking different.
-
-**p (instance probabilities):** Used to isolate individual objects when multiple are present. When planning a trajectory for object 1, you only track keypoints that belong to instance 1.
-
-Together these three let the system define a cost function: project your 3D keypoints into a reference camera view, compare their 2D positions against where the correspondences say they should be in the goal image, and minimize that distance through Model Predictive Control. The robot keeps acting until the cost is zero — meaning the scene looks like the goal.
-
----
-
-## Why This Approach Is Powerful
-
-The key insight is that by lifting 2D foundation model features into 3D space through this projection-and-fusion scheme, you get the best of both worlds: the rich semantic understanding that DINOv2 and SAM were trained to provide, grounded in accurate 3D geometry from your depth cameras. Neither component required any training on robot data. The whole system runs zero-shot on scenes and objects it has never seen before, which is what makes it practical for real-world robotics where you can't collect training data for every possible object.
+'''
