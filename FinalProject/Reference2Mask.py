@@ -25,7 +25,7 @@ def load_camera_calibration():
     Load actual ZED2i calibration data
     Replace paths with your actual calibration files
     """
-    with open('zed2i_calibration.json', 'r') as f:
+    with open('calibration_results.json', 'r') as f:
         calib = json.load(f)
     
     intrinsics_cam1 = np.array(calib['cam1']['intrinsics'])
@@ -37,7 +37,7 @@ def load_camera_calibration():
     cam1 = CameraParameters(
         name="cam1",
         image_path="cam1.png",
-        depth_path="cam1_depth.npy",
+        depth_path="depth_outputs/cam1.npy",
         intrinsics=intrinsics_cam1,
         extrinsics=extrinsics_cam1
     )
@@ -45,7 +45,7 @@ def load_camera_calibration():
     cam2 = CameraParameters(
         name="cam2",
         image_path="cam2.png",
-        depth_path="cam2_depth.npy",
+        depth_path="depth_outputs/cam2.npy",
         intrinsics=intrinsics_cam2,
         extrinsics=extrinsics_cam2
     )
