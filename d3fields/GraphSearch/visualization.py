@@ -159,8 +159,7 @@ def _log_gripper_axes(entity_path, pose, size=0.05):
     rr.log(entity_path, rr.LineStrips3D(points, colors=colors, radii=0.002))
 
 
-def visualize_optimization(object_pcd_np, Q, trajectory, contact_pts_world,
-                           frame_size=0.05):
+def visualize_optimization(object_pcd_np, Q, trajectory, frame_size=0.05):
     """Log the optimization trajectory to Rerun as a time sequence."""
     _ensure_rr()
 
@@ -170,12 +169,6 @@ def visualize_optimization(object_pcd_np, Q, trajectory, contact_pts_world,
         object_pcd_np,
         colors=np.full((object_pcd_np.shape[0], 3), 180, dtype=np.uint8),
         radii=0.002), static=True)
-
-    blue = np.full((contact_pts_world.shape[0], 3), [50, 100, 255],
-                   dtype=np.uint8)
-    rr.log(f"{prefix}/ref_contact_pts",
-           rr.Points3D(contact_pts_world, colors=blue, radii=0.003),
-           static=True)
 
     ones = np.ones((Q.shape[0], 1))
     Q_homo = np.hstack([Q, ones])

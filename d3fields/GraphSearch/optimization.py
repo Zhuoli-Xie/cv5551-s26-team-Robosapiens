@@ -7,7 +7,7 @@ from .cost_functions import compute_cost
 
 
 def optimize_grasp_pose(fusion_new, Q_np, f_star_np, init_pose,
-                        w_f=1.0, w_d=0.1,
+                        w_f=1.0, w_d=0.1, w_n=0.5,
                         n_restarts=10, n_iters=200, lr=1e-3,
                         perturb_rot=0.3, perturb_trans=0.03,
                         device='cuda', verbose=True):
@@ -70,7 +70,7 @@ def optimize_grasp_pose(fusion_new, Q_np, f_star_np, init_pose,
             R = axis_angle_to_rotation_matrix(aa_param)
             approach_local = torch.tensor([0.0, 0.0, 1.0], device=device)
             cost = compute_cost(fusion_new, Q, f_star, R, t_param,
-                                w_f=w_f, w_d=w_d, w_n=0.5,
+                                w_f=w_f, w_d=w_d, w_n=w_n,
                                 approach_local=approach_local)
             cost.backward()
             optimizer.step()

@@ -102,7 +102,7 @@ def load_gripper_pose(path):
     return np.loadtxt(path)
 
 
-def load_scene(data_path, timestep, device):
+def load_scene(data_path, timestep, device, feat_backbone='dinov2'):
     """Load scene data + pre-computed masks, build Fusion with D3Fields.
 
     Returns:
@@ -114,8 +114,9 @@ def load_scene(data_path, timestep, device):
     print(f"Loading pre-computed masks from {data_path}...")
     masks = load_masks(data_path, timestep, num_cam)
 
-    print(f"Building D3Fields (Fusion) with {num_cam} cameras...")
-    fusion = Fusion(num_cam=num_cam, feat_backbone='dinov2',
+    print(f"Building D3Fields (Fusion) with {num_cam} cameras "
+          f"(backbone={feat_backbone})...")
+    fusion = Fusion(num_cam=num_cam, feat_backbone=feat_backbone,
                     device=device, skip_xmem=True)
     fusion.update(obs)
 

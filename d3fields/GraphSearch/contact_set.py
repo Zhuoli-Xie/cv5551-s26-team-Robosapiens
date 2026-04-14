@@ -20,27 +20,26 @@ returned separately for visualization or per-finger weighting.
 import numpy as np
 import open3d as o3d
 import torch
+from scipy.spatial import cKDTree
 from utils.my_utils import fps_np
 
 
 # ── Tune these for the actual hardware ──────────────────────────────────────
-FINGER_HALF_WIDTH = 0.035   # half of max stroke (70 mm / 2)
-FINGER_LENGTH     = 0.046   # finger protrusion along Z
-TCP_OFFSET        = 0.067   # distance from wrist origin to fingertip plane
+FINGER_HALF_WIDTH = 0.020   # half of max stroke (70 mm / 2)
+FINGER_LENGTH     = 0.020   # finger protrusion along Z
+TCP_OFFSET        = 0.047   # distance from wrist origin to fingertip plane
 # ────────────────────────────────────────────────────────────────────────────
-
-FINGER_BASE_Z = TCP_OFFSET - FINGER_LENGTH
 
 # Six key points in gripper-local frame
 #   0: palm centre   1: left tip   2: right tip
 #   3: left base     4: right base  5: wrist origin
 GRIPPER_POINTS_LOCAL = np.array([
-    [0,  0,                 FINGER_BASE_Z],  # 0
-    [0,  FINGER_HALF_WIDTH, TCP_OFFSET],     # 1 left  fingertip
-    [0, -FINGER_HALF_WIDTH, TCP_OFFSET],     # 2 right fingertip
-    [0,  FINGER_HALF_WIDTH, FINGER_BASE_Z],  # 3 left  finger base
-    [0, -FINGER_HALF_WIDTH, FINGER_BASE_Z],  # 4 right finger base
-    [0,  0,                 0],              # 5 wrist origin
+    [0,  0,                 0],  # 0
+    [0,  FINGER_HALF_WIDTH, FINGER_LENGTH],     # 1 left  fingertip
+    [0, -FINGER_HALF_WIDTH, FINGER_LENGTH],     # 2 right fingertip
+    [0,  FINGER_HALF_WIDTH, 0],  # 3 left  finger base
+    [0, -FINGER_HALF_WIDTH, 0],  # 4 right finger base
+    [0,  0,                 -TCP_OFFSET],              # 5 wrist origin
 ], dtype=np.float64)
 
 GRIPPER_EDGES = [
@@ -82,19 +81,84 @@ def gripper_points_world(gripper_pose):
 # Contact set construction
 # ---------------------------------------------------------------------------
 
-def _contact_set_near_point(fusion, object_pcd, anchor_world, n_points,
-                             distance_thresh, gripper_pose_inv, device, label):
-    """Sample n_points near anchor_world, query descriptors, convert to local frame."""
+def _sample_surface_points(object_pcd, anchor_world, n_points,
+                           distance_thresh, label):
+    """Pick n_points from `object_pcd` near `anchor_world` (original strategy)."""
     dists = np.linalg.norm(object_pcd - anchor_world, axis=1)
     near_pts = object_pcd[dists < distance_thresh]
 
     if near_pts.shape[0] >= n_points:
         near_pts, _, _ = fps_np(near_pts, n_points)
-        print(f"  [{label}] {n_points} pts within {distance_thresh:.3f} m of fingertip")
+        print(f"  [{label}] {n_points} surface pts within "
+              f"{distance_thresh*1000:.0f} mm of fingertip")
     else:
         print(f"  [{label}] Only {near_pts.shape[0]} pts within "
-              f"{distance_thresh:.3f} m — using closest {n_points} surface pts")
+              f"{distance_thresh*1000:.0f} mm — using closest {n_points} surface pts")
         near_pts = object_pcd[np.argsort(dists)[:n_points]]
+    return near_pts
+
+
+def _sample_shell_points(object_pcd, anchor_world, n_points,
+                         distance_thresh, surface_offset, label,
+                         n_candidates=4000, rng_seed=0):
+    """Sample n_points in a near-surface shell ball around `anchor_world`.
+
+    Candidates are drawn uniformly inside a ball of radius `distance_thresh`
+    around the fingertip, then kept only if they lie within `surface_offset`
+    of the nearest object surface point.  Admits off-surface query points
+    around the fingertip while excluding free-space points whose D3Fields
+    features would be unreliable.
+    """
+    surf_tree = cKDTree(object_pcd)
+
+    rng = np.random.default_rng(rng_seed)
+    u = rng.standard_normal(size=(n_candidates, 3))
+    u /= np.linalg.norm(u, axis=1, keepdims=True) + 1e-9
+    r = rng.uniform(size=n_candidates) ** (1.0 / 3.0) * distance_thresh
+    candidates = anchor_world + u * r[:, None]
+
+    surf_d, _ = surf_tree.query(candidates, k=1)
+    shell_pts = candidates[surf_d < surface_offset]
+
+    if shell_pts.shape[0] >= n_points:
+        near_pts, _, _ = fps_np(shell_pts, n_points)
+        print(f"  [{label}] {n_points} shell pts "
+              f"(<= {surface_offset*1000:.0f} mm off surface, "
+              f"<= {distance_thresh*1000:.0f} mm from fingertip)")
+    else:
+        tip_dists = np.linalg.norm(object_pcd - anchor_world, axis=1)
+        n_pad = n_points - shell_pts.shape[0]
+        pad = object_pcd[np.argsort(tip_dists)[:n_pad]]
+        if shell_pts.shape[0] > 0:
+            near_pts = np.concatenate([shell_pts, pad], axis=0)
+            print(f"  [{label}] Only {shell_pts.shape[0]} shell pts — "
+                  f"padding with {n_pad} closest surface pts")
+        else:
+            near_pts = pad
+            print(f"  [{label}] No shell pts — falling back to "
+                  f"{n_points} closest surface pts")
+    return near_pts
+
+
+def _contact_set_near_point(fusion, object_pcd, anchor_world, n_points,
+                             distance_thresh, gripper_pose_inv, device, label,
+                             mode='shell', surface_offset=0.008):
+    """Sample query points near `anchor_world` and fetch their descriptors.
+
+    `mode`:
+      'surface' — classic: pick from points already on `object_pcd`.
+      'shell'   — volumetric: random candidates near the fingertip, kept
+                  within `surface_offset` of the surface.
+    """
+    if mode == 'surface':
+        near_pts = _sample_surface_points(
+            object_pcd, anchor_world, n_points, distance_thresh, label)
+    elif mode == 'shell':
+        near_pts = _sample_shell_points(
+            object_pcd, anchor_world, n_points,
+            distance_thresh, surface_offset, label)
+    else:
+        raise ValueError(f"Unknown contact-set mode: {mode!r}")
 
     pts_tensor = torch.from_numpy(near_pts).to(device, dtype=torch.float32)
     with torch.no_grad():
@@ -108,7 +172,8 @@ def _contact_set_near_point(fusion, object_pcd, anchor_world, n_points,
 
 
 def build_contact_set(fusion_ref, object_pcd, gripper_pose, n_points,
-                      distance_thresh=0.008, device='cuda'):
+                      distance_thresh=0.008, mode='shell',
+                      surface_offset=0.008, device='cuda'):
     """
     Build two contact sets (one per fingertip) and return them concatenated.
 
@@ -118,6 +183,9 @@ def build_contact_set(fusion_ref, object_pcd, gripper_pose, n_points,
         gripper_pose    : (4, 4) demo gripper pose in world frame
         n_points        : points per fingertip (total = 2 * n_points)
         distance_thresh : search radius around each fingertip (metres)
+        mode            : 'surface' (points from object_pcd only) or
+                          'shell'   (random shell sampling around the surface)
+        surface_offset  : (shell mode) max distance from surface a query may lie (metres)
         device          : torch device
 
     Returns:
@@ -132,11 +200,13 @@ def build_contact_set(fusion_ref, object_pcd, gripper_pose, n_points,
 
     Q_L, f_L, pts_L = _contact_set_near_point(
         fusion_ref, object_pcd, left_tip,  n_points,
-        distance_thresh, T_inv, device, "left fingertip")
+        distance_thresh, T_inv, device, "left fingertip",
+        mode=mode, surface_offset=surface_offset)
 
     Q_R, f_R, pts_R = _contact_set_near_point(
         fusion_ref, object_pcd, right_tip, n_points,
-        distance_thresh, T_inv, device, "right fingertip")
+        distance_thresh, T_inv, device, "right fingertip",
+        mode=mode, surface_offset=surface_offset)
 
     Q           = np.concatenate([Q_L, Q_R], axis=0)
     f_star      = np.concatenate([f_L, f_R], axis=0)

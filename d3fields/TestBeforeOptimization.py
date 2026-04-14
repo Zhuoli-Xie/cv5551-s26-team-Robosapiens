@@ -37,19 +37,17 @@ from sklearn.decomposition import PCA
 #   - left/right tip:    fingertip positions
 #   - left/right base:   finger root (where finger meets palm)
 #   - end effector:      wrist / mounting point
-FINGER_HALF_WIDTH = 0.035   # half of 70 mm max stroke
-FINGER_LENGTH     = 0.046   # finger protrusion length
-TCP_OFFSET        = 0.067   # TCP offset from wrist
-
-FINGER_BASE_Z = TCP_OFFSET - FINGER_LENGTH  # where fingers meet the palm
+FINGER_HALF_WIDTH = 0.020   # half of 40 mm max stroke
+FINGER_LENGTH     = 0.020   # finger protrusion length
+TCP_OFFSET        = 0.047   # TCP offset from wrist
 
 GRIPPER_POINTS_LOCAL = np.array([
-    [0,  0,                FINGER_BASE_Z],   # 0: center (midpoint at finger base level)
-    [0,  FINGER_HALF_WIDTH, TCP_OFFSET],     # 1: left fingertip
-    [0, -FINGER_HALF_WIDTH, TCP_OFFSET],     # 2: right fingertip
-    [0,  FINGER_HALF_WIDTH, FINGER_BASE_Z],  # 3: left finger base
-    [0, -FINGER_HALF_WIDTH, FINGER_BASE_Z],  # 4: right finger base
-    [0,  0,                0],               # 5: end effector (T's origin)
+    [0,  0,                0],   # 0: center (midpoint at finger base level)
+    [0,  FINGER_HALF_WIDTH, FINGER_LENGTH],     # 1: left fingertip
+    [0, -FINGER_HALF_WIDTH, FINGER_LENGTH],     # 2: right fingertip
+    [0,  FINGER_HALF_WIDTH, 0],  # 3: left finger base
+    [0, -FINGER_HALF_WIDTH, 0],  # 4: right finger base
+    [0,  0,                -TCP_OFFSET],               # 5: end effector (T's origin)
 ])
 
 # Edges connecting the six points to form the gripper shape
@@ -59,6 +57,49 @@ GRIPPER_EDGES = [
     (3, 5), (4, 5),   # palm to wrist
     (0, 5),            # center to wrist (stem)
 ]
+
+# ── Tool-frame → gripper-frame correction ──────────────────────────────────
+# The saved `gripper_pose.npy` is the xArm TCP pose (flange +Z = approach,
+# offset 47 mm forward via set_tcp_offset). `GRIPPER_POINTS_LOCAL` assumes
+# +Z = approach and ±Y = finger-opening. If the Lite6 Gripper Lite is bolted
+# onto the flange rotated about Z, the opening axis of the physical gripper
+# does not line up with local-Y and the visualised gripper looks rotated
+# about the approach axis.
+#
+# Edit `TOOL_TO_GRIPPER` below to match the actual mounting. It is
+# right-multiplied onto the pose:  world_pts = pose @ TOOL_TO_GRIPPER @ local_pts
+#
+# Common candidates — try them in order until the fingers line up:
+#   np.eye(4)                              # no correction
+#   Rz(+90 deg)  -> swap  X↔Y (fingers along flange-X)
+#   Rz(-90 deg)  -> swap  Y↔X
+#   Rz(+180 deg) -> flip  L/R (gripper mounted rotated 180°)
+def _Rx(deg):
+    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
+    T = np.eye(4)
+    T[:3, :3] = [[1, 0, 0], [0, c, -s], [0, s, c]]
+    return T
+
+def _Ry(deg):
+    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
+    T = np.eye(4)
+    T[:3, :3] = [[c, 0, s], [0, 1, 0], [-s, 0, c]]
+    return T
+
+def _Rz(deg):
+    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
+    T = np.eye(4)
+    T[:3, :3] = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+    return T
+
+# Composed tool→gripper correction:
+#   _Rx(90) first rotates local +Z (approach) onto tool +Y,
+#   _Ry(90) then rotates about the (new) green axis to line up the finger
+#   opening direction with the physical gripper.
+# Flip either sign (_Rx(-90), _Ry(-90)) if the result points the wrong way.
+# TOOL_TO_GRIPPER = _Rx(90) @ _Rz(-45)
+TOOL_TO_GRIPPER = np.eye(4)
+_ = _Rz  # keep helper available for quick swaps via `_Rz(180)` etc.
 
 
 # ── Data loading ────────────────────────────────────────────────────────────
@@ -334,11 +375,33 @@ def visualize_point_cloud(pts, rgb):
 # ── Visualization 3: Gripper + point cloud in Plotly ────────────────────────
 
 def transform_gripper(pose):
-    """Transform local gripper points to world frame using pose (4x4)."""
+    """Transform local gripper points to world frame using pose (4x4).
+
+    Applies TOOL_TO_GRIPPER correction so local +Z/±Y align with the
+    physical approach / opening axes of the mounted gripper.
+    """
     ones = np.ones((GRIPPER_POINTS_LOCAL.shape[0], 1))
     local_h = np.hstack([GRIPPER_POINTS_LOCAL, ones])
-    world = (pose @ local_h.T).T[:, :3]
+    world = (pose @ TOOL_TO_GRIPPER @ local_h.T).T[:, :3]
     return world
+
+
+def make_pose_axes_traces(pose, name="tool", length=0.05):
+    """Draw raw pose axes (X=red, Y=green, Z=blue) to diagnose orientation."""
+    origin = pose[:3, 3]
+    R = pose[:3, :3]
+    traces = []
+    for vec, col, lbl in [(R[:, 0], "red",   "X"),
+                          (R[:, 1], "green", "Y"),
+                          (R[:, 2], "blue",  "Z")]:
+        tip = origin + length * vec
+        traces.append(go.Scatter3d(
+            x=[origin[0], tip[0]], y=[origin[1], tip[1]], z=[origin[2], tip[2]],
+            mode="lines+text", line=dict(color=col, width=6),
+            text=["", f"{name}:{lbl}"], textposition="top center",
+            showlegend=False,
+        ))
+    return traces
 
 
 def make_gripper_traces(pose, name="gripper", color="red"):
@@ -393,6 +456,7 @@ def visualize_gripper_with_pcd(pts, rgb, gripper_poses, subsample=5000):
     for i, pose in enumerate(gripper_poses):
         c = palette[i % len(palette)]
         traces += make_gripper_traces(pose, name=f"gripper_{i}", color=c)
+        traces += make_pose_axes_traces(pose, name=f"pose_{i}")
 
     fig = go.Figure(data=traces)
     fig.update_layout(

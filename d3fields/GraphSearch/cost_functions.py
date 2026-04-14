@@ -130,12 +130,17 @@ def compute_cost(fusion_new, Q, f_star, R, trans,
     """
     x = (R @ Q.T).T + trans  # (N, 3)
 
-    out = fusion_new.eval(x, return_names=['dino_feats'])
-    f_new = out['dino_feats']
+    return_names = ['dino_feats'] if w_f > 0 else []
+    out = fusion_new.eval(x, return_names=return_names)
     d_new = out['dist']
 
-    cost = w_f * feature_cost(f_new, f_star)
-    cost = cost + w_d * distance_cost(d_new)
+    cost = torch.zeros((), device=x.device, dtype=x.dtype)
+
+    if w_f > 0:
+        cost = cost + w_f * feature_cost(out['dino_feats'], f_star)
+
+    if w_d > 0:
+        cost = cost + w_d * distance_cost(d_new)
 
     if w_n > 0 and approach_local is not None:
         approach_world = R @ approach_local

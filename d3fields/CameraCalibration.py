@@ -2,15 +2,13 @@
 CameraCalibration.py
 
 Calibrates ZED cameras against the robot base frame using AprilTags,
-then saves RGB, depth, intrinsics, and extrinsics in the directory
-layout expected by the D^3 Fields pipeline (grasp_pose_search.py).
+then saves intrinsics and extrinsics in the directory layout expected
+by the D^3 Fields pipeline.
 
 Output structure
 ----------------
     <output_dir>/
         camera_0/
-            color/0.png              # BGR uint8
-            depth/0.png              # uint16, millimetres
             camera_extrinsics.npy    # (4, 4) float64  T_cam_robot
             camera_params.npy        # [fx, fy, cx, cy]
         camera_1/
@@ -183,53 +181,6 @@ def preview_cameras(cameras, detector):
 
 
 # ---------------------------------------------------------------------------
-# Save in D^3 Fields format
-# ---------------------------------------------------------------------------
-
-def _depth_vis(depth_m):
-    """Convert float32 depth (metres) to a colourmap PNG for inspection.
-
-    Valid pixels are normalised to the scene's [min, max] range and mapped
-    with COLORMAP_INFERNO.  Invalid (NaN/Inf) pixels are rendered black.
-    """
-    valid = np.isfinite(depth_m)
-    vis = np.zeros((*depth_m.shape, 3), dtype=np.uint8)
-    if valid.any():
-        lo, hi = depth_m[valid].min(), depth_m[valid].max()
-        norm = np.zeros_like(depth_m)
-        if hi > lo:
-            norm[valid] = (depth_m[valid] - lo) / (hi - lo)
-        grey = (norm * 255).clip(0, 255).astype(np.uint8)
-        vis = cv2.applyColorMap(grey, cv2.COLORMAP_INFERNO)
-        vis[~valid] = 0  # black out invalid pixels
-    return vis
-
-
-def save_camera(cam, extrinsic, cam_dir, timestep=0):
-    """Save RGB, depth (npz + vis png), intrinsics, and extrinsic for one camera."""
-    cam_dir = Path(cam_dir)
-    (cam_dir / "color").mkdir(parents=True, exist_ok=True)
-    (cam_dir / "depth").mkdir(parents=True, exist_ok=True)
-
-    img = cam.image
-    cv2.imwrite(str(cam_dir / "color" / f"{timestep}.png"), img)
-
-    depth_m = cam.depth  # float32, metres
-    np.savez_compressed(str(cam_dir / "depth" / f"{timestep}.npz"), depth=depth_m)
-    cv2.imwrite(str(cam_dir / "depth" / f"{timestep}_vis.png"), _depth_vis(depth_m))
-
-    np.save(str(cam_dir / "camera_extrinsics.npy"), extrinsic)
-
-    K = cam.camera_intrinsic
-    np.save(str(cam_dir / "camera_params.npy"),
-            np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]]))
-
-    valid = depth_m[np.isfinite(depth_m)]
-    print(f"  {cam_dir.name}: color {img.shape[:2]}, "
-          f"depth [{valid.min():.3f}, {valid.max():.3f}] m")
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -239,8 +190,6 @@ def parse_args():
                    help="Directory to save captured scene data")
     p.add_argument("--ids", type=int, nargs="+", default=None,
                    help="ZED camera USB indices (default: auto-detect all)")
-    p.add_argument("-t", "--timestep", type=int, default=0,
-                   help="Timestep label for saved files (default: 0)")
     return p.parse_args()
 
 
@@ -274,12 +223,19 @@ def main():
             if T is None:
                 print(f"Calibration failed for {label}. Make sure AprilTags are visible.")
                 sys.exit(1)
-            save_camera(cam, T, output_dir / f"camera_{i}", timestep=args.timestep)
+
+            cam_dir = output_dir / f"camera_{i}"
+            cam_dir.mkdir(parents=True, exist_ok=True)
+            np.save(str(cam_dir / "camera_extrinsics.npy"), T)
+            K = cam.camera_intrinsic
+            np.save(str(cam_dir / "camera_params.npy"),
+                    np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]]))
+            print(f"  camera_{i}: extrinsics and intrinsics saved")
     finally:
         for cam in cameras:
             cam.close()
 
-    print(f"\nScene saved -> {output_dir.resolve()}  ({len(cameras)} cameras, t={args.timestep})")
+    print(f"\nCalibration saved -> {output_dir.resolve()}  ({len(cameras)} cameras)")
 
 
 if __name__ == "__main__":
