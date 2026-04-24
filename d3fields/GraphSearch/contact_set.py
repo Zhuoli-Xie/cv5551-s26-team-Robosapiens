@@ -3,10 +3,11 @@ Gripper geometry + contact set construction.
 
 Gripper geometry
 ----------------
-All points are in the gripper-local frame where:
-  - Origin = TCP (wrist mounting point)
-  - Z      = approach / insertion direction
-  - Y      = finger opening direction
+All points are in the flange-local frame — matching the saved `ee_pose.npy`
+(flange pose in base_link, NO TCP offset applied). Axes:
+  - Origin = flange (wrist mounting plane)
+  - +Z     = approach / insertion direction (flange → TCP → fingertips)
+  - ±Y     = finger opening direction
 
 Adjust the three constants at the top when the physical gripper changes.
 
@@ -25,21 +26,21 @@ from utils.my_utils import fps_np
 
 
 # ── Tune these for the actual hardware ──────────────────────────────────────
-FINGER_HALF_WIDTH = 0.020   # half of max stroke (70 mm / 2)
-FINGER_LENGTH     = 0.020   # finger protrusion along Z
-TCP_OFFSET        = 0.047   # distance from wrist origin to fingertip plane
+TCP_OFFSET        = 0.047   # 47 mm: flange → TCP along local +Z
+FINGER_LENGTH     = 0.023   # 23 mm: finger base → fingertip along local +Z
+FINGER_HALF_WIDTH = 0.020   # 20 mm: TCP → finger along local ±Y
 # ────────────────────────────────────────────────────────────────────────────
 
-# Six key points in gripper-local frame
-#   0: palm centre   1: left tip   2: right tip
-#   3: left base     4: right base  5: wrist origin
+# Six key points in flange-local frame
+#   0: TCP/palm centre   1: left tip   2: right tip
+#   3: left base         4: right base  5: flange origin
 GRIPPER_POINTS_LOCAL = np.array([
-    [0,  0,                 0],  # 0
-    [0,  FINGER_HALF_WIDTH, FINGER_LENGTH],     # 1 left  fingertip
-    [0, -FINGER_HALF_WIDTH, FINGER_LENGTH],     # 2 right fingertip
-    [0,  FINGER_HALF_WIDTH, 0],  # 3 left  finger base
-    [0, -FINGER_HALF_WIDTH, 0],  # 4 right finger base
-    [0,  0,                 -TCP_OFFSET],              # 5 wrist origin
+    [0,  0,                 TCP_OFFSET],                    # 0 TCP / palm centre
+    [0,  FINGER_HALF_WIDTH, TCP_OFFSET + FINGER_LENGTH],    # 1 left  fingertip
+    [0, -FINGER_HALF_WIDTH, TCP_OFFSET + FINGER_LENGTH],    # 2 right fingertip
+    [0,  FINGER_HALF_WIDTH, TCP_OFFSET],                    # 3 left  finger base
+    [0, -FINGER_HALF_WIDTH, TCP_OFFSET],                    # 4 right finger base
+    [0,  0,                 0],                             # 5 flange origin
 ], dtype=np.float64)
 
 GRIPPER_EDGES = [

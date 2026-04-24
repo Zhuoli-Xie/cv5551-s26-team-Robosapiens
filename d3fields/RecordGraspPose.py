@@ -1,12 +1,17 @@
 """
-Record xArm Lite6 gripper poses interactively. Saved 4x4 matrix is in metres.
+Record xArm Lite6 end-effector poses interactively.
+
+For each saved pose the script writes:
+  - ee_pose.npy      : 4x4 transform of the end-effector in the robot
+                       base_link frame, translation in metres.
+  - robot_state.json : raw API values (EE pose mm/deg + joint angles).
 
 Run:  python RecordGraspPose.py --robot-ip <IP> -o <output_dir>
 
 Controls
 --------
 s      – save camera snapshot (first press only; requires --camera-ids)
-Enter  – save current gripper pose
+Enter  – save current end-effector pose
 q      – quit
 """
 from __future__ import annotations
@@ -25,8 +30,6 @@ try:
     _ZED_AVAILABLE = True
 except ImportError:
     _ZED_AVAILABLE = False
-
-GRIPPER_LENGTH = 0.047 * 1000  # mm, TCP offset
 
 
 # ---------------------------------------------------------------------------
@@ -96,53 +99,61 @@ def _init_arm(ip: str) -> XArmAPI:
     arm = XArmAPI(ip)
     arm.connect()
     arm.motion_enable(enable=True)
-    arm.set_tcp_offset([0, 0, GRIPPER_LENGTH, 0, 0, 0])
     arm.set_mode(0)
     arm.set_state(0)
     return arm
 
 
 def _read_robot_state(arm: XArmAPI) -> dict:
+    """Return the raw end-effector pose and joint angles from the xArm API."""
     code_p, pos = arm.get_position(is_radian=False)
     code_j, angles = arm.get_servo_angle(is_radian=False)
     return {
         "code_position": int(code_p),
-        "tcp_pose_mm_deg": list(pos) if pos is not None else None,
+        "ee_pose_mm_deg": list(pos) if pos is not None else None,
         "code_joints": int(code_j),
         "joints_deg": list(angles) if angles is not None else None,
     }
 
 
-def _tcp_to_4x4(tcp_pose_mm_deg: list[float]) -> np.ndarray:
-    """Convert xArm TCP pose [x,y,z,rx,ry,rz] (mm, deg) to 4x4 matrix (metres)."""
-    x, y, z, rx, ry, rz = tcp_pose_mm_deg
-    rvec = np.radians([rx, ry, rz]).reshape(3, 1)
-    R, _ = cv2.Rodrigues(rvec)
+def _ee_pose_to_4x4(pose_mm_deg: list[float]) -> np.ndarray:
+    """xArm EE pose [x,y,z,rx,ry,rz] (mm, deg, RPY) → 4x4 in base_link (m).
+
+    xArm Cartesian orientation is RPY Euler (extrinsic XYZ), so
+    R = Rz(yaw) @ Ry(pitch) @ Rx(roll).
+    """
+    x, y, z, rx, ry, rz = pose_mm_deg
+    cx, sx = np.cos(np.radians(rx)), np.sin(np.radians(rx))
+    cy, sy = np.cos(np.radians(ry)), np.sin(np.radians(ry))
+    cz, sz = np.cos(np.radians(rz)), np.sin(np.radians(rz))
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
     T = np.eye(4)
-    T[:3, :3] = R
+    T[:3, :3] = Rz @ Ry @ Rx
     T[:3, 3] = [x / 1000.0, y / 1000.0, z / 1000.0]
     return T
 
 
 def _save_pose(arm: XArmAPI, session_dir: Path, idx: int) -> bool:
-    """Read and save the current gripper pose. Returns True on success."""
+    """Read and save the current end-effector pose. Returns True on success."""
     state = _read_robot_state(arm)
-    tcp = state["tcp_pose_mm_deg"]
-    if tcp is None:
-        print("  Failed to read TCP pose.")
+    pose = state["ee_pose_mm_deg"]
+    if pose is None:
+        print("  Failed to read end-effector pose.")
         return False
 
-    T = _tcp_to_4x4(tcp)
+    T = _ee_pose_to_4x4(pose)
     pose_dir = session_dir / f"pose_{idx:04d}"
     pose_dir.mkdir(exist_ok=True)
-    np.save(str(pose_dir / "gripper_pose.npy"), T)
-    np.savetxt(str(pose_dir / "gripper_pose.txt"), T)
+    np.save(str(pose_dir / "ee_pose.npy"), T)
     (pose_dir / "robot_state.json").write_text(
         json.dumps({"time": datetime.now().isoformat(), **state}, indent=2),
         encoding="utf-8",
     )
-    print(f"  Saved pose_{idx:04d}/gripper_pose.npy")
-    print(f"  TCP (mm, deg): {[f'{v:.2f}' for v in tcp]}")
+    print(f"  Saved pose_{idx:04d}/ee_pose.npy (4x4, base_link, metres)")
+    print(f"  EE pose [x,y,z (mm), rx,ry,rz (deg)]: "
+          f"{[f'{v:.3f}' for v in pose]}")
     print(f"  Translation (m): [{T[0,3]:.4f}, {T[1,3]:.4f}, {T[2,3]:.4f}]")
     return True
 
@@ -152,7 +163,7 @@ def _save_pose(arm: XArmAPI, session_dir: Path, idx: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Record gripper poses from xArm Lite6.")
+    p = argparse.ArgumentParser(description="Record end-effector poses from xArm Lite6.")
     p.add_argument("--robot-ip", default="192.168.1.168", help="xArm controller IP")
     p.add_argument("-o", "--output", type=Path, default=Path("demos"),
                    help="Root directory for sessions (default: demos)")

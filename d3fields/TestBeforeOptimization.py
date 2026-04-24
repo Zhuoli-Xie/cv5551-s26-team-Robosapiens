@@ -4,15 +4,15 @@ TestBeforeOptimization.py
 Visualize pipeline outputs before running grasp optimization:
   1. Mask & DINO feature images from GroundingDINO + SAM + DINOv2
   2. Merged 3D point cloud from multi-view depth
-  3. Gripper poses overlaid on the point cloud (interactive Plotly) 
-  Dimensions: 35mm half-width, 46mm finger length, 67mm TCP offset 
+  3. EE frame + tool-tip (EE + GRIPPER_TCP_OFFSET along local +Z)
+     overlaid on the point cloud (interactive Plotly)
 
 Usage
 -----
     # Run detection + show all visualizations
     python TestBeforeOptimization.py -d data/mugs --text "mug"
 
-    # Skip detection, just visualize existing outputs + gripper poses
+    # Skip detection, just visualize existing outputs + EE/tool-tip
     python TestBeforeOptimization.py -d data/mugs --skip-detect --pose-idx 0 1 2
 """
 
@@ -29,77 +29,6 @@ import torch
 import torchvision.transforms as T
 from PIL import Image
 from sklearn.decomposition import PCA
-
-
-# ── Lite6 Gripper Lite geometry (metres) ────────────────────────────────────
-# Six key points in the gripper-local frame (Z = approach direction):
-#   - center:            TCP origin
-#   - left/right tip:    fingertip positions
-#   - left/right base:   finger root (where finger meets palm)
-#   - end effector:      wrist / mounting point
-FINGER_HALF_WIDTH = 0.020   # half of 40 mm max stroke
-FINGER_LENGTH     = 0.020   # finger protrusion length
-TCP_OFFSET        = 0.047   # TCP offset from wrist
-
-GRIPPER_POINTS_LOCAL = np.array([
-    [0,  0,                0],   # 0: center (midpoint at finger base level)
-    [0,  FINGER_HALF_WIDTH, FINGER_LENGTH],     # 1: left fingertip
-    [0, -FINGER_HALF_WIDTH, FINGER_LENGTH],     # 2: right fingertip
-    [0,  FINGER_HALF_WIDTH, 0],  # 3: left finger base
-    [0, -FINGER_HALF_WIDTH, 0],  # 4: right finger base
-    [0,  0,                -TCP_OFFSET],               # 5: end effector (T's origin)
-])
-
-# Edges connecting the six points to form the gripper shape
-GRIPPER_EDGES = [
-    (1, 3), (2, 4),   # left finger, right finger
-    (3, 4),            # palm bar
-    (3, 5), (4, 5),   # palm to wrist
-    (0, 5),            # center to wrist (stem)
-]
-
-# ── Tool-frame → gripper-frame correction ──────────────────────────────────
-# The saved `gripper_pose.npy` is the xArm TCP pose (flange +Z = approach,
-# offset 47 mm forward via set_tcp_offset). `GRIPPER_POINTS_LOCAL` assumes
-# +Z = approach and ±Y = finger-opening. If the Lite6 Gripper Lite is bolted
-# onto the flange rotated about Z, the opening axis of the physical gripper
-# does not line up with local-Y and the visualised gripper looks rotated
-# about the approach axis.
-#
-# Edit `TOOL_TO_GRIPPER` below to match the actual mounting. It is
-# right-multiplied onto the pose:  world_pts = pose @ TOOL_TO_GRIPPER @ local_pts
-#
-# Common candidates — try them in order until the fingers line up:
-#   np.eye(4)                              # no correction
-#   Rz(+90 deg)  -> swap  X↔Y (fingers along flange-X)
-#   Rz(-90 deg)  -> swap  Y↔X
-#   Rz(+180 deg) -> flip  L/R (gripper mounted rotated 180°)
-def _Rx(deg):
-    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
-    T = np.eye(4)
-    T[:3, :3] = [[1, 0, 0], [0, c, -s], [0, s, c]]
-    return T
-
-def _Ry(deg):
-    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
-    T = np.eye(4)
-    T[:3, :3] = [[c, 0, s], [0, 1, 0], [-s, 0, c]]
-    return T
-
-def _Rz(deg):
-    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
-    T = np.eye(4)
-    T[:3, :3] = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
-    return T
-
-# Composed tool→gripper correction:
-#   _Rx(90) first rotates local +Z (approach) onto tool +Y,
-#   _Ry(90) then rotates about the (new) green axis to line up the finger
-#   opening direction with the physical gripper.
-# Flip either sign (_Rx(-90), _Ry(-90)) if the result points the wrong way.
-# TOOL_TO_GRIPPER = _Rx(90) @ _Rz(-45)
-TOOL_TO_GRIPPER = np.eye(4)
-_ = _Rz  # keep helper available for quick swaps via `_Rz(180)` etc.
 
 
 # ── Data loading ────────────────────────────────────────────────────────────
@@ -372,19 +301,7 @@ def visualize_point_cloud(pts, rgb):
                                       width=1024, height=768)
 
 
-# ── Visualization 3: Gripper + point cloud in Plotly ────────────────────────
-
-def transform_gripper(pose):
-    """Transform local gripper points to world frame using pose (4x4).
-
-    Applies TOOL_TO_GRIPPER correction so local +Z/±Y align with the
-    physical approach / opening axes of the mounted gripper.
-    """
-    ones = np.ones((GRIPPER_POINTS_LOCAL.shape[0], 1))
-    local_h = np.hstack([GRIPPER_POINTS_LOCAL, ones])
-    world = (pose @ TOOL_TO_GRIPPER @ local_h.T).T[:, :3]
-    return world
-
+# ── Visualization 3: EE frame + tool tip in Plotly ────────────────────────
 
 def make_pose_axes_traces(pose, name="tool", length=0.05):
     """Draw raw pose axes (X=red, Y=green, Z=blue) to diagnose orientation."""
@@ -404,36 +321,145 @@ def make_pose_axes_traces(pose, name="tool", length=0.05):
     return traces
 
 
-def make_gripper_traces(pose, name="gripper", color="red"):
-    """Create Plotly traces (points + lines) for one gripper pose."""
-    pts = transform_gripper(pose)
-    labels = ["center", "L-tip", "R-tip", "L-base", "R-base", "wrist"]
+# ── Gripper geometry, relative to the EE / flange frame ───────────────────
+# The recorded ee_pose.npy is the flange pose with NO TCP offset applied,
+# so all gripper points below live in the flange-local frame:
+#   local +Z : approach direction (out of the flange toward fingertips)
+#   local ±Y : finger opening direction (nominal mounting)
+GRIPPER_TCP_OFFSET    = 0.047   # 47 mm: flange → TCP along local +Z
+GRIPPER_FINGER_LENGTH = 0.023   # 23 mm: finger base → fingertip along local +Z
+GRIPPER_FINGER_HALF_W = 0.020   # 20 mm: TCP → finger along local ±Y
 
-    # Scatter for the 6 key points
-    scatter = go.Scatter3d(
-        x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
-        mode="markers+text", text=labels, textposition="top center",
-        marker=dict(size=5, color=color),
-        name=name,
+
+def make_tooltip_traces(pose, name, color, tcp_offset=GRIPPER_TCP_OFFSET):
+    """Draw the tool-tip marker and the EE→tool-tip connector.
+
+    The tool tip sits at `tcp_offset` along the EE-local +Z axis.
+    """
+    flange = pose[:3, 3]
+    tip = (pose @ np.array([0.0, 0.0, tcp_offset, 1.0]))[:3]
+
+    line = go.Scatter3d(
+        x=[flange[0], tip[0]], y=[flange[1], tip[1]], z=[flange[2], tip[2]],
+        mode="lines",
+        line=dict(color=color, width=6, dash="dot"),
+        name=f"{name} offset",
+        showlegend=False,
     )
-
-    # Lines for the gripper edges
-    lx, ly, lz = [], [], []
-    for a, b in GRIPPER_EDGES:
-        lx += [pts[a, 0], pts[b, 0], None]
-        ly += [pts[a, 1], pts[b, 1], None]
-        lz += [pts[a, 2], pts[b, 2], None]
-
-    lines = go.Scatter3d(
-        x=lx, y=ly, z=lz,
-        mode="lines", line=dict(color=color, width=4),
-        name=f"{name} edges", showlegend=False,
+    marker = go.Scatter3d(
+        x=[tip[0]], y=[tip[1]], z=[tip[2]],
+        mode="markers+text",
+        marker=dict(size=8, color=color, symbol="cross"),
+        text=[f"{name} tip ({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f})"],
+        textposition="top center",
+        name=f"{name} tip",
     )
-    return [scatter, lines]
+    return [line, marker]
+
+
+def make_finger_traces(pose, name, color,
+                       tcp_offset=GRIPPER_TCP_OFFSET,
+                       finger_length=GRIPPER_FINGER_LENGTH,
+                       finger_half_w=GRIPPER_FINGER_HALF_W):
+    """Draw the two fingers plus markers at each finger base and fingertip.
+
+    Each finger is a segment along local +Z, from `tcp_offset` (finger base)
+    to `tcp_offset + finger_length` (fingertip), offset by ±finger_half_w on
+    local Y.
+    """
+    z_base = tcp_offset
+    z_tip  = tcp_offset + finger_length
+
+    traces = []
+    bases_xyz, tips_xyz, base_labels, tip_labels = [], [], [], []
+    for sign, side in [(+1, "L"), (-1, "R")]:
+        base = (pose @ np.array([0.0, sign * finger_half_w, z_base, 1.0]))[:3]
+        tip  = (pose @ np.array([0.0, sign * finger_half_w, z_tip,  1.0]))[:3]
+        traces.append(go.Scatter3d(
+            x=[base[0], tip[0]], y=[base[1], tip[1]], z=[base[2], tip[2]],
+            mode="lines",
+            line=dict(color=color, width=5),
+            name=f"{name} finger {side}",
+            showlegend=False,
+        ))
+        bases_xyz.append(base)
+        tips_xyz.append(tip)
+        base_labels.append(f"{name} {side}-base")
+        tip_labels.append(f"{name} {side}-tip")
+
+    bases_xyz = np.asarray(bases_xyz)
+    tips_xyz = np.asarray(tips_xyz)
+
+    traces.append(go.Scatter3d(
+        x=bases_xyz[:, 0], y=bases_xyz[:, 1], z=bases_xyz[:, 2],
+        mode="markers+text",
+        marker=dict(size=6, color=color, symbol="circle"),
+        text=base_labels, textposition="bottom center",
+        name=f"{name} finger bases", showlegend=False,
+    ))
+    traces.append(go.Scatter3d(
+        x=tips_xyz[:, 0], y=tips_xyz[:, 1], z=tips_xyz[:, 2],
+        mode="markers+text",
+        marker=dict(size=7, color=color, symbol="diamond-open"),
+        text=tip_labels, textposition="top center",
+        name=f"{name} fingertips", showlegend=False,
+    ))
+    return traces
+
+
+def make_palm_traces(pose, name, color,
+                     tcp_offset=GRIPPER_TCP_OFFSET,
+                     finger_half_w=GRIPPER_FINGER_HALF_W):
+    """Step 3: close the gripper outline with the palm bar and slanted
+    palm-to-flange edges.
+
+    Adds three segments in flange-local coords:
+      - palm bar:    [0, +HW, tcp] ↔ [0, -HW, tcp]
+      - palm → flange (L/R): [0, ±HW, tcp] ↔ [0, 0, 0]
+    The central stem [0,0,tcp] ↔ [0,0,0] is already drawn by Step 1.
+    """
+    flange    = (pose @ np.array([0.0, 0.0,                0.0,        1.0]))[:3]
+    base_L    = (pose @ np.array([0.0,  finger_half_w,     tcp_offset, 1.0]))[:3]
+    base_R    = (pose @ np.array([0.0, -finger_half_w,     tcp_offset, 1.0]))[:3]
+
+    segments = [
+        ("palm",       base_L, base_R),
+        ("palm-flg L", base_L, flange),
+        ("palm-flg R", base_R, flange),
+    ]
+    traces = []
+    for label, a, b in segments:
+        traces.append(go.Scatter3d(
+            x=[a[0], b[0]], y=[a[1], b[1]], z=[a[2], b[2]],
+            mode="lines",
+            line=dict(color=color, width=4),
+            name=f"{name} {label}",
+            showlegend=False,
+        ))
+    return traces
+
+
+def make_frame_marker_traces(pose, name, color, axis_length=0.05, marker_size=8):
+    """Marker dot + XYZ axes + label for a single 4x4 frame."""
+    origin = pose[:3, 3]
+    point = go.Scatter3d(
+        x=[origin[0]], y=[origin[1]], z=[origin[2]],
+        mode="markers+text",
+        marker=dict(size=marker_size, color=color, symbol="diamond"),
+        text=[f"{name} EE ({origin[0]:.3f}, {origin[1]:.3f}, {origin[2]:.3f})"],
+        textposition="bottom center",
+        name=f"{name} EE",
+    )
+    return [point] + make_pose_axes_traces(pose, name=name, length=axis_length)
 
 
 def visualize_gripper_with_pcd(pts, rgb, gripper_poses, subsample=5000):
-    """Interactive Plotly visualization of point cloud + gripper poses."""
+    """Interactive Plotly visualization of point cloud + gripper poses.
+
+    Always overlays the base_link origin and (for each loaded pose) the
+    end-effector position so the EE pose can be checked against the
+    point cloud regardless of whether the gripper geometry is shown.
+    """
     # Subsample point cloud for performance
     if len(pts) > subsample:
         idx = np.random.choice(len(pts), subsample, replace=False)
@@ -451,16 +477,25 @@ def visualize_gripper_with_pcd(pts, rgb, gripper_poses, subsample=5000):
         name="point cloud",
     )]
 
+    # base_link origin (poses are saved in base_link frame)
+    traces += make_frame_marker_traces(np.eye(4), name="base_link",
+                                       color="black", axis_length=0.08,
+                                       marker_size=10)
+
     palette = ["red", "blue", "green", "orange", "purple",
                "cyan", "magenta", "yellow"]
     for i, pose in enumerate(gripper_poses):
         c = palette[i % len(palette)]
-        traces += make_gripper_traces(pose, name=f"gripper_{i}", color=c)
-        traces += make_pose_axes_traces(pose, name=f"pose_{i}")
+        # EE (flange) marker + XYZ axes at EE
+        traces += make_frame_marker_traces(pose, name=f"ee_{i}", color=c)
+        # Tool-tip marker offset along local +Z
+        traces += make_tooltip_traces(pose, name=f"ee_{i}", color=c)
+        # Fingers + fingertip / finger-base markers
+        traces += make_finger_traces(pose, name=f"ee_{i}", color=c)
 
     fig = go.Figure(data=traces)
     fig.update_layout(
-        title="Point Cloud + Gripper Poses (Lite6 Gripper Lite)",
+        title="Point Cloud + EE frame & base_link",
         scene=dict(aspectmode="data"),
         width=1200, height=800,
     )
@@ -522,16 +557,17 @@ def main():
     if pose_dir.is_dir():
         for idx in args.pose_idx:
             pose_subdir = pose_dir / f"pose_{idx:04d}"
-            npy = pose_subdir / "gripper_pose.npy"
-            txt = pose_subdir / "gripper_pose.txt"
-            if npy.exists():
-                gripper_poses.append(np.load(str(npy)))
-                print(f"  Loaded pose_{idx:04d}/gripper_pose.npy")
-            elif txt.exists():
-                gripper_poses.append(np.loadtxt(str(txt)))
-                print(f"  Loaded pose_{idx:04d}/gripper_pose.txt")
+            ee_npy = pose_subdir / "ee_pose.npy"
+            if ee_npy.exists():
+                pose = np.load(str(ee_npy))
+                gripper_poses.append(pose)
+                tip = (pose @ np.array([0.0, 0.0, GRIPPER_TCP_OFFSET, 1.0]))[:3]
+                print(f"  Loaded pose_{idx:04d}/ee_pose.npy "
+                      f"-> EE  @ ({pose[0,3]:.3f}, {pose[1,3]:.3f}, {pose[2,3]:.3f}) m"
+                      f"\n                             "
+                      f"-> tip @ ({tip[0]:.3f}, {tip[1]:.3f}, {tip[2]:.3f}) m")
             else:
-                print(f"  Warning: no gripper pose found in {pose_subdir}")
+                print(f"  Warning: no EE pose found in {pose_subdir}")
     else:
         print(f"  No target_grasp_pose directory at {pose_dir}")
 

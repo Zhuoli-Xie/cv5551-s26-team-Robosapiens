@@ -99,9 +99,8 @@ def visualize_dino_matching(object_pcd_np, contact_pts, corr_pts,
 # Open3D: single pose visualization
 # ---------------------------------------------------------------------------
 
-def visualize_pose(object_pcd_np, Q, pose, contact_pts_world,
-                   title="Pose", frame_size=0.05):
-    """Show a single gripper pose with query points and contact points."""
+def visualize_pose(object_pcd_np, Q, pose, title="Pose", frame_size=0.05):
+    """Show a single gripper pose with query points and the robot base frame."""
     geometries = []
 
     obj_pcd = o3d.geometry.PointCloud()
@@ -109,9 +108,12 @@ def visualize_pose(object_pcd_np, Q, pose, contact_pts_world,
     obj_pcd.paint_uniform_color([0.7, 0.7, 0.7])
     geometries.append(obj_pcd)
 
-    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=frame_size)
-    frame.transform(pose)
-    geometries.append(frame)
+    gripper_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=frame_size)
+    gripper_frame.transform(pose)
+    geometries.append(gripper_frame)
+
+    base_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=frame_size * 2)
+    geometries.append(base_frame)
 
     ones = np.ones((Q.shape[0], 1))
     Q_homo = np.hstack([Q, ones])
@@ -120,11 +122,6 @@ def visualize_pose(object_pcd_np, Q, pose, contact_pts_world,
     q_pcd.points = o3d.utility.Vector3dVector(x_world)
     q_pcd.paint_uniform_color([1.0, 0.2, 0.2])
     geometries.append(q_pcd)
-
-    c_pcd = o3d.geometry.PointCloud()
-    c_pcd.points = o3d.utility.Vector3dVector(contact_pts_world)
-    c_pcd.paint_uniform_color([0.2, 0.4, 1.0])
-    geometries.append(c_pcd)
 
     o3d.visualization.draw_geometries(geometries, window_name=title,
                                       width=1024, height=768)

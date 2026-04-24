@@ -136,8 +136,8 @@ def build_object_pcd(colors, depths, intrinsics, extrinsics, boundaries,
         downsample=True, masks=masks, boundaries=boundaries)
     _, inlier_idx = pcd_o3d.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
     pcd_o3d = pcd_o3d.select_by_index(inlier_idx)
-    # _, inlier_idx = pcd_o3d.remove_radius_outlier(nb_points=5, radius=0.02)
-    # pcd_o3d = pcd_o3d.select_by_index(inlier_idx)
+    _, inlier_idx = pcd_o3d.remove_radius_outlier(nb_points=5, radius=0.02)
+    pcd_o3d = pcd_o3d.select_by_index(inlier_idx)
     # if z_max is not None:
     #     pts = np.asarray(pcd_o3d.points)
     #     pcd_o3d = pcd_o3d.select_by_index(np.where(pts[:, 2] <= z_max)[0])

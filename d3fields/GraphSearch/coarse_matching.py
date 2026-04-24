@@ -15,8 +15,8 @@ def coarse_match_init_pose(fusion_new, object_pcd_new, contact_pts_world,
         1. Query DINO descriptors on the new scene's object point cloud.
         2. For each reference contact descriptor f_i*, find the point in the
            new scene with maximum cosine similarity -> correspondence point c_i.
-        3. Solve the rigid alignment  contact_pts_world -> c  via SVD
-           (Procrustes), giving T_coarse.
+        3. Solve weighted Procrustes (weight = per-pair cosine similarity) for
+           both R and t — low-confidence matches contribute ~0 pull.
         4. Recover the gripper pose as  T_init = T_coarse * T_demo.
 
     Returns:
@@ -57,20 +57,22 @@ def coarse_match_init_pose(fusion_new, object_pcd_new, contact_pts_world,
     corr_pts_v = object_pcd_new[nn_idx_v]
     best_sim_v = cos_sim_v.max(dim=1).values
 
-    # 4. SVD rigid alignment on valid pairs only
+    # 4. Weighted Procrustes: bad matches (low cosine similarity) contribute ~0.
     src = contact_pts_world[valid]
     dst = corr_pts_v
-    src_mean = src.mean(axis=0)
-    dst_mean = dst.mean(axis=0)
-    src_c = src - src_mean
-    dst_c = dst - dst_mean
-    H = src_c.T @ dst_c
+
+    w = best_sim_v.clamp(min=0.0).cpu().numpy()
+    w = w / (w.sum() + 1e-12)
+
+    src_wmean = (w[:, None] * src).sum(axis=0)
+    dst_wmean = (w[:, None] * dst).sum(axis=0)
+    H = ((src - src_wmean) * w[:, None]).T @ (dst - dst_wmean)
     U, _, Vt = np.linalg.svd(H)
     R_align = Vt.T @ U.T
     if np.linalg.det(R_align) < 0:
         Vt[-1, :] *= -1
         R_align = Vt.T @ U.T
-    t_align = dst_mean - R_align @ src_mean
+    t_align = dst_wmean - R_align @ src_wmean
 
     T_coarse = np.eye(4)
     T_coarse[:3, :3] = R_align
@@ -82,8 +84,9 @@ def coarse_match_init_pose(fusion_new, object_pcd_new, contact_pts_world,
     print(f"  Coarse match: median cosine similarity = "
           f"{best_sim_v.median().item():.4f} "
           f"(over {int(valid.sum())} valid contacts)")
-    print(f"  Coarse alignment residual (mean): "
-          f"{np.linalg.norm(dst - (R_align @ src.T).T - t_align, axis=1).mean():.4f} m")
+    resid = np.linalg.norm(dst - (R_align @ src.T).T - t_align, axis=1)
+    print(f"  Coarse alignment residual (weighted mean): "
+          f"{(w * resid).sum():.4f} m")
 
     # 6. Re-expand to full length so downstream viz keeps aligned indices.
     # Invalid rows: corr point = self (no-op line) and nn_dist = 1 (max).
@@ -128,7 +131,7 @@ def visualize_coarse_match(object_pcd_ref, contact_pts_world, object_pcd_new,
     # Horizontal offset so the target scene sits to the right of the reference.
     left_xyz = np.concatenate([object_pcd_ref, contact_pts_world], axis=0)
     right_xyz = np.concatenate([object_pcd_new, corr_pts], axis=0)
-    gap = 0.25 * max(
+    gap = 1.5 * max(
         left_xyz[:, 0].max() - left_xyz[:, 0].min(),
         right_xyz[:, 0].max() - right_xyz[:, 0].min(),
         0.1,

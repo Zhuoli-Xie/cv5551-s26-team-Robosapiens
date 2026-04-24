@@ -8,7 +8,7 @@ Pipeline (run after CameraCalibration.py + RecordGraspPose.py):
     3. Load target scene     — same pipeline on the new scene (or self-test)
     4. Coarse matching       — DINO feature NN + SVD Procrustes alignment
     5. Fine optimization     — multi-start SE(3) optimization on the cost function
-    6. Save result           — .npz with optimized pose + metadata
+    6. Save result           — optimized_grasp.npy: 4x4 EE pose in base_link
     7. Visualize             — Rerun for optimization trajectory, Open3D for rest
 
 Usage
@@ -56,10 +56,6 @@ def parse_args():
                    help="Reference scene directory")
     p.add_argument("--new-scene", type=str, default=None,
                    help="Target scene directory (default: same as --data-dir for self-test)")
-    p.add_argument("-t", "--timestep", type=int, default=0,
-                   help="Timestep for reference scene (default: 0)")
-    p.add_argument("--new-timestep", type=int, default=None,
-                   help="Timestep for target scene (default: same as --timestep)")
 
     # Gripper
     p.add_argument("--gripper-pose", type=str, required=True,
@@ -90,47 +86,35 @@ def parse_args():
                         "the object surface (default: 0.008 m).")
 
     # Optimization
-    p.add_argument("--w-f", type=float, default=1.0,
-                   help="Feature cost weight (set 0 to disable)")
-    p.add_argument("--w-d", type=float, default=0.0,
-                   help="Distance cost weight (set 0 to disable), default: 0.1")
-    p.add_argument("--w-n", type=float, default=0.0,
-                   help="Normal-alignment cost weight (set 0 to disable), default: 0.5")
+    p.add_argument("--w-f", type=float, default=0.0,
+                   help="Feature cost weight — small residual safety net; "
+                        "coarse stage already handled semantic correspondence.")
+    p.add_argument("--w-d", type=float, default=1.0,
+                   help="Distance (squared-SDF surface-fit) cost weight — "
+                        "primary driver for local rotation refinement.")
+    p.add_argument("--w-n", type=float, default=0.5,
+                   help="Normal-alignment cost weight — locks approach "
+                        "direction against the surface normal.")
     p.add_argument("--n-restarts", type=int, default=10)
-    p.add_argument("--n-iters", type=int, default=200)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--perturb-rot", type=float, default=0.6)
-    p.add_argument("--perturb-trans", type=float, default=0.2)
+    p.add_argument("--n-iters", type=int, default=150)
+    p.add_argument("--lr", type=float, default=5e-4,
+                   help="Fallback learning rate — used for translation when "
+                        "--lr-trans is not given.")
+    p.add_argument("--lr-rot", type=float, default=3e-3,
+                   help="Adam LR for 6D rotation params (default 1e-2). "
+                        "Typically ~10x lr-trans because Gram-Schmidt absorbs "
+                        "the radial component of each rotation update.")
+    p.add_argument("--lr-trans", type=float, default=None,
+                   help="Adam LR for translation params (metres). "
+                        "Defaults to --lr.")
+    p.add_argument("--perturb-rot", type=float, default=0.04)
+    p.add_argument("--perturb-trans", type=float, default=0.01)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--feat-backbone", type=str, default="dinov3",
                    choices=["dinov2", "dinov3"],
                    help="DINO backbone for D3Fields features")
 
     return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Save results
-# ---------------------------------------------------------------------------
-
-def save_results(output_path, best_pose, best_cost, init_pose, T_demo,
-                 Q, f_star, all_results):
-    """Save inference results to a single .npz file."""
-    all_poses = np.stack([p for p, _ in all_results])
-    all_costs = np.array([c for _, c in all_results])
-
-    np.savez(
-        str(output_path),
-        best_pose=best_pose,
-        best_cost=np.array(best_cost),
-        init_pose=init_pose,
-        demo_pose=T_demo,
-        query_points_local=Q,
-        reference_descriptors=f_star,
-        all_restart_poses=all_poses,
-        all_restart_costs=all_costs,
-    )
-    print(f"Saved results -> {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +134,7 @@ def main():
     # ── Step 1-2: Load reference scene + build contact set ────────────────
     print("=== Loading reference scene ===")
     fusion_ref, colors_ref, depths_ref, intrinsics, extrinsics, ref_masks, _ = \
-        load_scene(args.data_dir, args.timestep, device,
+        load_scene(args.data_dir, 0, device,
                    feat_backbone=args.feat_backbone)
 
     print("\n=== Building contact set ===")
@@ -173,8 +157,7 @@ def main():
 
     # ── Step 3: Load target scene ─────────────────────────────────────────
     new_scene = args.new_scene or args.data_dir
-    new_t = args.new_timestep if args.new_timestep is not None else args.timestep
-    is_self_test = (new_scene == args.data_dir and new_t == args.timestep)
+    is_self_test = (new_scene == args.data_dir)
 
     if is_self_test:
         print("\nSelf-test mode: using same scene for reference and target.")
@@ -182,9 +165,9 @@ def main():
         colors_new, depths_new = colors_ref, depths_ref
         new_masks = ref_masks
     else:
-        print(f"\n=== Loading target scene: {new_scene} t={new_t} ===")
+        print(f"\n=== Loading target scene: {new_scene} ===")
         fusion_new, colors_new, depths_new, _, _, new_masks, _ = \
-            load_scene(new_scene, new_t, device,
+            load_scene(new_scene, 0, device,
                        feat_backbone=args.feat_backbone)
 
     object_pcd_new = build_object_pcd(
@@ -238,26 +221,28 @@ def main():
 
     # ── Step 5: Fine optimization ─────────────────────────────────────────
     print("\n=== Fine optimization ===")
-    best_pose, best_cost, all_results, best_trajectory = optimize_grasp_pose(
+    lr_trans = args.lr_trans if args.lr_trans is not None else args.lr
+    best_pose, best_cost, _, best_trajectory = optimize_grasp_pose(
         fusion_new, Q, f_star, init_pose,
         w_f=args.w_f, w_d=args.w_d, w_n=args.w_n,
-        n_restarts=args.n_restarts, n_iters=args.n_iters, lr=args.lr,
+        n_restarts=args.n_restarts, n_iters=args.n_iters,
+        lr_rot=args.lr_rot, lr_trans=lr_trans,
         perturb_rot=args.perturb_rot, perturb_trans=args.perturb_trans,
         device=device)
     print(f"\nBest cost: {best_cost:.6f}")
     print(f"Optimized pose:\n{best_pose}")
 
-    # ── Step 6: Save results (.npz) ──────────────────────────────────────
-    out_path = Path(args.data_dir) / "optimized_grasp.npz"
-    save_results(out_path, best_pose, best_cost, init_pose, T_demo,
-                 Q, f_star, all_results)
+    # ── Step 6: Save result — 4x4 EE pose in base_link frame ─────────────
+    out_path = Path(args.data_dir) / "optimized_grasp.npy"
+    np.save(str(out_path), best_pose)
+    print(f"Saved optimized EE pose (base_link, 4x4) -> {out_path}")
 
     # ── Step 7: Visualize ─────────────────────────────────────────────────
     print("\n=== Visualization ===")
 
     # Open3D: final optimized pose
     if best_pose is not None:
-        visualize_pose(object_pcd_new, Q, best_pose, contact_pts,
+        visualize_pose(object_pcd_new, Q, best_pose,
                        title="Optimized Grasp Pose")
     else:
         print("WARNING: optimization did not converge — skipping pose visualization.")

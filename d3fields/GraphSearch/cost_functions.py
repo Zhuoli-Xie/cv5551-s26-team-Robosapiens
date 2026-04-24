@@ -25,7 +25,11 @@ def estimate_normals_fd(fusion, x, eps=0.002):
         eps   : step size
 
     Returns:
-        normals: (N, 3) tensor, unit normals
+        normals      : (N, 3) tensor, unit normals
+        normals_valid: (N,)   bool tensor — True when all 6 FD probes hit a
+                              valid camera view. Points with any invalid probe
+                              would otherwise inherit the 1e3 sentinel and
+                              poison the normal direction.
     """
     N = x.shape[0]
     offsets = torch.zeros(6, 3, device=x.device, dtype=x.dtype)
@@ -41,6 +45,7 @@ def estimate_normals_fd(fusion, x, eps=0.002):
 
     out = fusion.eval(x_perturbed, return_names=[])
     d = out['dist'].reshape(6, N)
+    v = out['valid_mask'].reshape(6, N)
 
     normals = torch.stack([
         d[0] - d[1],
@@ -49,58 +54,76 @@ def estimate_normals_fd(fusion, x, eps=0.002):
     ], dim=1) / (2 * eps)
 
     normals = normals / (normals.norm(dim=1, keepdim=True) + 1e-8)
-    return normals
+    normals_valid = v.all(dim=0)
+    return normals, normals_valid
 
 
 # ---------------------------------------------------------------------------
 # Individual cost terms
 # ---------------------------------------------------------------------------
 
-def feature_cost(f_new, f_star):
-    """L2 feature matching cost: sum_i ||f_new(x_i) - f_i*||^2.
+def feature_cost(f_new, f_star, valid_mask=None):
+    """Cosine-distance feature matching cost: sum_i (1 - cos(f_new_i, f_i*)).
 
-    Args:
-        f_new  : (N, D) tensor, descriptors at transformed query points
-        f_star : (N, D) tensor, reference descriptors
+    Matches the coarse stage's objective so fine optimization refines rather
+    than fights the SVD Procrustes init. Raw L2 on DINO features is dominated
+    by magnitude variation across patch tokens and produces spurious minima.
 
-    Returns:
-        scalar tensor
+    Invalid-mask points are zeroed out (Fusion returns a zero feature vector
+    for them, which would otherwise contribute cos_sim=0 → cost=1 each).
     """
-    return torch.sum((f_new - f_star) ** 2, dim=1).sum()
+    f_new_n = torch.nn.functional.normalize(f_new, dim=1, eps=1e-8)
+    f_star_n = torch.nn.functional.normalize(f_star, dim=1, eps=1e-8)
+    cos_sim = (f_new_n * f_star_n).sum(dim=1)
+    per_point = 1.0 - cos_sim
+    if valid_mask is not None:
+        per_point = per_point * valid_mask.float()
+    return per_point.sum()
 
 
-def distance_cost(d_new):
-    """Signed distance cost: sum_i d_new(x_i).
+def distance_cost(d_new, valid_mask=None):
+    """Squared-SDF surface-fit cost: sum_i d_new(x_i)^2.
 
-    Encourages query points to lie on the object surface.
+    Two-sided penalty that pulls query points onto the surface from either
+    side. The signed-sum form let the optimizer drive points deep into the
+    object to drop the cost without improving the fit.
 
-    Args:
-        d_new: (N,) tensor, SDF values at transformed query points
-
-    Returns:
-        scalar tensor
+    Invalid points carry a 1e3 sentinel from Fusion — masking them out keeps
+    the cost on a real scale (≤ mu² per valid point) instead of the sentinel
+    drowning everything at ~1e6 per invalid point.
     """
-    return d_new.sum()
+    per_point = d_new ** 2
+    if valid_mask is not None:
+        per_point = per_point * valid_mask.float()
+    return per_point.sum()
 
 
-def normal_alignment_cost(fusion, x, approach_world):
+def normal_alignment_cost(fusion, x, approach_world, valid_mask=None):
     """Normal alignment cost: sum_i (1 + n(x_i) . a)^2.
 
     Penalizes gripper approach directions that are not anti-parallel
     to the surface normal (i.e., encourages the gripper to approach
     perpendicular to the surface).
 
+    The FD probe returns its own validity mask; we AND it with the
+    caller-supplied mask so only fully-valid points contribute.
+
     Args:
         fusion         : Fusion object (for SDF normal estimation)
         x              : (N, 3) tensor, transformed query points
         approach_world : (3,) tensor, gripper approach direction in world frame
+        valid_mask     : (N,) bool tensor or None; center-point validity
 
     Returns:
         scalar tensor
     """
-    normals = estimate_normals_fd(fusion, x)
+    normals, normals_valid = estimate_normals_fd(fusion, x)
+    if valid_mask is not None:
+        normals_valid = normals_valid & valid_mask
     alignment = torch.sum(normals * approach_world.unsqueeze(0), dim=1)
-    return ((1.0 + alignment) ** 2).sum()
+    per_point = (1.0 + alignment) ** 2
+    per_point = per_point * normals_valid.float()
+    return per_point.sum()
 
 
 # ---------------------------------------------------------------------------
@@ -133,17 +156,19 @@ def compute_cost(fusion_new, Q, f_star, R, trans,
     return_names = ['dino_feats'] if w_f > 0 else []
     out = fusion_new.eval(x, return_names=return_names)
     d_new = out['dist']
+    valid = out['valid_mask']
 
     cost = torch.zeros((), device=x.device, dtype=x.dtype)
 
     if w_f > 0:
-        cost = cost + w_f * feature_cost(out['dino_feats'], f_star)
+        cost = cost + w_f * feature_cost(out['dino_feats'], f_star, valid_mask=valid)
 
     if w_d > 0:
-        cost = cost + w_d * distance_cost(d_new)
+        cost = cost + w_d * distance_cost(d_new, valid_mask=valid)
 
     if w_n > 0 and approach_local is not None:
         approach_world = R @ approach_local
-        cost = cost + w_n * normal_alignment_cost(fusion_new, x, approach_world)
+        cost = cost + w_n * normal_alignment_cost(fusion_new, x, approach_world,
+                                                   valid_mask=valid)
 
     return cost
